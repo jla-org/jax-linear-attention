@@ -1,0 +1,52 @@
+# Copyright 2026 KarLex AI, Inc.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Llama/Qwen3-style 125M decoder (GQA, QK-norm, SwiGLU, RoPE) on a CIDX corpus.
+# Prepare data with:
+#   python -m jla.cli tokenize --input train.jsonl --output /path/to/corpus/train --tokenizer EleutherAI/gpt-neox-20b
+# then point data.paths at the output prefix. With 8 devices (fsdp = 8) one
+# step is 16 x 8 sequences of 2048 tokens (262k tokens).
+
+name = "transformer-125m"
+
+[model]
+preset = "transformer-125m"
+
+[optim]
+name = "adamw"
+lr = 6e-4
+schedule = "wsd"
+warmup_steps = 2000
+stable_fraction = 0.8
+min_lr_ratio = 0.1
+b2 = 0.95
+weight_decay = 0.1
+max_grad_norm = 1.0
+
+[train]
+max_steps = 50000
+seq_len = 2048
+micro_batch_per_replica = 16
+grad_accum = 1
+z_loss = 1e-4
+log_every = 50
+eval_every = 1000
+eval_batches = 50
+save_every = 2000
+keep_checkpoints = 3
+output_dir = "runs/transformer-125m"
+
+[data]
+source = "cidx"
+paths = ["/path/to/corpus/train"]  # placeholder: a `jla tokenize` output prefix
+eval_holdout_records = 4096  # tail documents of the corpus held out for evaluation
+num_workers = 4
+prefetch = 8
+
+[mesh]
+dp = 1
+fsdp = -1
+tp = 1
+
+[runtime]
+xla_tuning_level = 1

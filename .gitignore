@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv*/
+build/
+dist/
+.pytest_cache/
+
+# Run outputs (the configs write to runs/ by default; the benchmark scripts write to benchmarks/results/)
+outputs/
+runs/
+/benchmarks/results/
+*.prof
+/wandb/
+
+# Local corpora and checkpoints from the README quick start. Root only:
+# tests/data/ and src/jla/data/ are part of the tree.
+/data/
+/ckpt/
+
+# Editors and operating systems
+.idea/
+.vscode/
+.DS_Store

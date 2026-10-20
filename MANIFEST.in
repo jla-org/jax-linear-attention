@@ -1,0 +1,8 @@
+# The sdist also carries what the tests and the README quick start read, the tested pins and the release files.
+graft benchmarks
+graft configs
+graft docs
+graft tests
+graft requirements
+include CHANGELOG.md CONTRIBUTING.md CITATION.cff
+global-exclude *.py[cod] .DS_Store

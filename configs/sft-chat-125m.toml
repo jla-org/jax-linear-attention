@@ -1,0 +1,48 @@
+# Copyright 2026 KarLex AI, Inc.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Supervised fine-tuning on chat data with a completion-only loss (assistant turns only).
+#
+# 1. Tokenize OpenAI/HF-style chat JSONL ({"messages": [{"role": ..., "content": ...}, ...]})
+#    with the tokenizer's chat template; writes data/sft/chat.{bin,idx,mask}:
+#      jla tokenize --format chat --input chats.jsonl --output data/sft/chat \
+#          --tokenizer HuggingFaceTB/SmolLM2-135M-Instruct
+#    (--loss-on last trains only the final assistant turn; --loss-on all every token.)
+# 2. Train; whole conversations are packed into rows with their own segment_ids:
+#      jla train --config configs/sft-chat-125m.toml
+# NOTE: `jla train` cannot load pretrained weights yet (there is no train.init_checkpoint), so this
+# config trains transformer-125m from random initialisation; lr = 2e-5 assumes a pretrained start.
+
+name = "sft-chat-125m"
+
+[model]
+preset = "transformer-125m"
+vocab_size = 49152  # the SmolLM2 tokenizer; set to your tokenizer's vocabulary size
+
+[optim]
+name = "adamw"
+lr = 2e-5
+schedule = "cosine"
+warmup_steps = 100
+min_lr_ratio = 0.0
+weight_decay = 0.0
+
+[train]
+max_steps = 2000
+seq_len = 4096
+micro_batch_per_replica = 4
+grad_accum = 4
+log_every = 10
+eval_every = 250
+eval_batches = 20
+save_every = 500
+output_dir = "runs/sft-chat-125m"
+
+[data]
+source = "sft"
+paths = ["data/sft/chat"]
+eval_holdout_records = 512  # the last 512 conversations evaluate the masked loss
+sft_packing = "bfd"  # "single" = one conversation per row
+sft_overlong = "truncate"  # or "drop" conversations longer than seq_len + 1 tokens
+sft_completion_only = true
+num_workers = 4

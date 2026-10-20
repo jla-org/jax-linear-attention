@@ -1,0 +1,68 @@
+# Copyright 2026 KarLex AI, Inc.
+# SPDX-License-Identifier: Apache-2.0
+#
+# benchmarks/end_to_end_1p3b.md: preset gdn-hd128-1p3b, seq 4096 with document masking on FineWeb-Edu
+# tokenized with the Llama-3.1 tokenizer (128,256 ids, EOS 128001) in 4096-token packed CIDX records.
+# micro_batch_per_replica 16 x 4096 = 65,536 tokens per GPU, 524,288 tokens per step on 8 GPUs.
+# Run it with benchmarks/bench_e2e_1p3b.py (sets data.paths and the timing settings) or with
+#   jla train --config benchmarks/end_to_end/1p3b/gdn-hd128-1p3b.toml --set 'data.paths=["/path/to/fineweb_edu_3B"]'
+name = "e2e-gdn-hd128-1p3b"
+
+[model]
+preset = "gdn-hd128-1p3b"
+# Full remat (the preset's default) at 16 x 4096 x 1 is the fastest setting with the short-conv and fused
+# short conv + SiLU + q/k L2-norm kernels on. The memory-lean alternative, remat = "none" + lean_vjp +
+# lean_remat_core at 4 x 4096 x grad_accum 4 with scan_unroll 1, fits on one H100 only in one preallocated
+# 0.92 pool (65.6 GiB) and measured 0.98x this step there (17 Oct, provisional). The fused conv + L2-norm
+# kernels keep running under lean_vjp (tests/test_lean_conv_l2norm.py). Opt in with JAX's default
+# preallocation left on (with preallocation off the first step fails to allocate a 45 GiB temporary):
+#   XLA_PYTHON_CLIENT_MEM_FRACTION=0.92 python benchmarks/bench_e2e_1p3b.py --micro-batch 4 --grad-accum 4
+#   --set 'model.remat="none"' --set model.lean_vjp=true --set model.lean_remat_core=true --set train.scan_unroll=1
+
+[optim]
+name = "adamw"
+lr = 3e-4
+schedule = "cosine"
+warmup_steps = 5
+min_lr_ratio = 0.1
+b1 = 0.9
+b2 = 0.95
+weight_decay = 0.1
+max_grad_norm = 1.0
+
+[train]
+max_steps = 20
+seq_len = 4096
+micro_batch_per_replica = 16
+grad_accum = 1
+z_loss = 0.0
+# The LM head's gradient formed in the forward pass (benchmarks/cross_entropy.md, "Training at 1.3B"; it
+# needs ce_impl "auto" or "mosaic_gpu"): 1.060x in bf16 and 1.070x in FP8 on one H100 in interleaved A/B runs
+# against ce_impl "xla", 1.076x on 8 GPUs (FSDP 8, FP8), with the 20-step loss within the distance of
+# an XLA run in another summation order (bf16) and inside the spread of repeated runs (FP8); peak memory
+# +0.2 GiB (benchmarks/cross_entropy.md, "Training at 1.3B"; 18 Oct 2026, provisional).
+ce_impl = "auto"
+ce_grad_in_forward = true
+log_every = 1
+eval_every = 0
+final_eval = false
+save_every = 0
+save_final = false
+output_dir = "runs/e2e-gdn-hd128-1p3b"
+
+[data]
+source = "cidx"
+paths = ["/path/to/fineweb_edu_3B"]  # the CIDX prefix: bench_e2e_1p3b.py --data, or --set data.paths=[...]
+exact_packed_records = true
+eos_id = 128001
+document_masking = true
+num_workers = 4
+prefetch = 8
+
+[mesh]
+dp = 1
+fsdp = -1
+tp = 1
+
+[runtime]
+xla_tuning_level = 1

@@ -1,0 +1,118 @@
+# CPU-only tests.
+#
+# Every push to main and every pull request runs the fast set: one job of about 10 minutes that covers the
+# public ops against their token-by-token references, the layers, models and presets, the trainer, data,
+# checkpoints and conversion. The whole CPU suite (about two hours of runner time) runs nightly and on demand
+# (Actions, CI, Run workflow), as four shards of whole test files.
+#
+# On CPU the Mosaic GPU kernel and cuDNN tests skip, the multi-GPU tests skip, and the long-context tests are
+# opt-in (--run-long-context, one H100). Tests that need an optional extra (transformers, tokenizers, lm-eval,
+# wandb, tensorboardX, datasets, pyarrow, orbax, torch) skip, because these jobs install only the test extra. No
+# test downloads anything: the tokenizer and Hugging Face tests read local files.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: true
+
+jobs:
+  fast:
+    name: CPU tests, fast set (Python 3.12)
+    if: github.event_name == 'push' || github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      JAX_PLATFORMS: cpu
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: Install the package with the test extra
+        run: python -m pip install ".[test]"
+      - name: Versions
+        run: python -c "import jax, jla; print('jax', jax.__version__, '| jla', jla.__version__, 'from', jla.__file__)"
+      - name: CPU tests, fast set
+        run: >-
+          python -m pytest -q -rfE --durations=10
+          tests/test_config.py
+          tests/test_reference_ops.py
+          tests/test_chunked_ops.py
+          tests/test_mamba3_mimo_vjp.py
+          tests/test_layers_basic.py
+          tests/test_layers_conv.py
+          tests/test_cross_entropy.py
+          tests/test_moe_permute.py
+          tests/test_flops_presets.py
+          tests/test_hybrid_presets_1p3b.py
+          tests/test_bench_e2e_1p3b.py
+          tests/test_bench_e2e_flame_report.py
+          tests/test_bench_end_to_end_step.py
+          tests/test_profile_1p3b.py
+          tests/test_speed_of_light_step.py
+          tests/test_xla_tuning_1p3b.py
+          tests/test_distributed_mesh.py
+          tests/test_kernel_sharding_rules.py
+          tests/test_data_cidx.py
+          tests/test_data_loader.py
+          tests/test_data_sft.py
+          tests/test_data_streaming.py
+          tests/test_checkpointing.py
+          tests/test_training_gpu_setup.py
+          tests/test_training_graph_health.py
+          tests/test_training_metrics_sink.py
+          tests/test_training_mixed_precision.py
+          tests/test_training_optimizers.py
+          tests/test_training_performance.py
+          tests/test_training_runtime.py
+          tests/test_training_schedulers.py
+          tests/test_training_telemetry.py
+          tests/test_training_step.py
+          tests/test_update_guard.py
+          tests/test_trainer_e2e.py
+
+  full:
+    name: CPU tests, full suite (Python 3.12, shard ${{ matrix.shard }} of 4)
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
+    env:
+      JAX_PLATFORMS: cpu
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: Install the package with the test extra
+        run: python -m pip install ".[test]"
+      - name: Versions
+        run: python -c "import jax, jla; print('jax', jax.__version__, '| jla', jla.__version__, 'from', jla.__file__)"
+      - name: CPU test suite, every fourth test file
+        run: |
+          files=$(find tests -maxdepth 1 -name "test_*.py" | LC_ALL=C sort | awk -v s=${{ matrix.shard }} 'NR % 4 == s')
+          python -m pytest $files -q -rfE --durations=15

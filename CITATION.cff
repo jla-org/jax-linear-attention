@@ -1,0 +1,20 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+type: software
+title: "jax-linear-attention"
+abstract: >-
+  A JAX LLM training template with Pallas Mosaic GPU kernels for linear attention,
+  state-space models and softmax attention on NVIDIA Hopper.
+authors:
+  - name: "KarLex AI, Inc."
+version: "0.1.0"
+date-released: "2026-10-21"
+license: Apache-2.0
+keywords:
+  - jax
+  - pallas
+  - mosaic-gpu
+  - linear-attention
+  - state-space-models
+  - llm-training
+repository-code: "https://github.com/jla-org/jax-linear-attention"

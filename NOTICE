@@ -1,0 +1,334 @@
+jax-linear-attention
+Copyright (c) 2026 KarLex AI, Inc.
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+This product includes software adapted from the following projects. Adapted
+files name their upstream project and source files in a header comment. The
+licence text of every project listed here is in licenses/.
+
+* Flash Linear Attention (https://github.com/fla-org/flash-linear-attention)
+  Copyright (c) 2023-2026 Songlin Yang, Yu Zhang, Zhiyuan Li and contributors.
+  MIT License (licenses/flash-linear-attention.LICENSE).
+  The Mosaic GPU kernels for Gated DeltaNet, DeltaNet, KDA, simple GLA and GLA
+  port its Triton kernels, and the linear-attention layers follow its layer
+  definitions. This includes the K = 256 Gated DeltaNet and DeltaNet kernels
+  (src/jla/ops/mosaic_gpu/scalar_gate_kb.py and gated_delta_rule_kb.py, after
+  fla/ops/gated_delta_rule/chunk.py, fla/ops/common/chunk_o.py and
+  fla/ops/common/chunk_delta_h.py), the grouped Mamba-2 B/C backward
+  (scalar_gate_grouped.py, after fla/ops/common/chunk_o.py chunk_bwd_dqkwg)
+  and the RWKV-7 Mosaic GPU path (rwkv7.py, after the DPLR kernels in
+  fla/ops/generalized_delta_rule/dplr/ and fla/ops/rwkv7/chunk.py; its
+  per-chunk kernels rwkv7_prep.py and rwkv7_bwd.py adapt dplr/chunk_A_fwd.py,
+  wy_fast_fwd.py, chunk_A_bwd.py, wy_fast_bwd.py, chunk_o_bwd.py and
+  chunk_h_bwd.py). The dedicated GLA kernels
+  (src/jla/ops/mosaic_gpu/gla_kernels.py) follow the stage split of
+  fla/ops/gla/chunk.py and the state recurrence of fla/ops/common/chunk_h.py.
+  The Gated DeltaProduct, RWKV-6, RWKV-7, HGRN2, FoX, PaTH, NSA, DSA,
+  log-linear attention and TTT-Linear layers or reference ops adapt its layers
+  and naive implementations, and the context-parallel state passing follows
+  its fla/ops/cp design. The gated RMSNorm backward of the fused Mamba-2
+  output glue (src/jla/layers/mamba2_fused.py) follows
+  fla/modules/fused_norm_gate.py. Forming the LM-head gradient in the forward
+  pass (src/jla/ops/mosaic_gpu/linear_cross_entropy.py) follows the design of
+  its FusedLinearCrossEntropyLoss (design only, no code copied). The
+  "upstream" initialisation reimplements its init schemes:
+  fla/models/mamba2/modeling_mamba2.py and fla/models/mamba3/modeling_mamba3.py
+  (rescale_prenorm_residual), fla/models/modeling_utils.py (_init_weights:
+  nn.Conv1d at normal(0, initializer_range)), fla/layers/rwkv7.py (zero
+  o_proj), fla/layers/rwkv6.py (LoRA: zero down, orthogonal up with gain 0.1)
+  and fla/models/rwkv7/modeling_rwkv7.py (zero channel-mix value).
+
+* Mamba (https://github.com/state-spaces/mamba)
+  Copyright (c) 2023-2026 Tri Dao, Albert Gu, Dao AI Lab, Goombalab and
+  contributors. Apache License 2.0 (licenses/mamba.LICENSE).
+  The Mamba-1, Mamba-2, Mamba-3 and Mamba-3 MIMO layers follow its modules,
+  the Mamba-1 op follows its selective_scan_ref, the Mamba-1 Mosaic GPU
+  kernels (src/jla/ops/mosaic_gpu/mamba1.py, mamba1_bwd.py and
+  mamba1_bwd2.py) follow the
+  design of its CUDA selective scan (csrc/selective_scan/
+  selective_scan_fwd_kernel.cuh and selective_scan_bwd_kernel.cuh), and
+  benchmarks/torch_mamba1.py and torch_upstream_diff.py call that kernel as
+  a baseline, the Mamba-3 Mosaic GPU
+  kernels port its Triton SISO kernels (including angle_dt.py for the fused
+  core), and the Mamba-3 MIMO Mosaic GPU kernels adapt its TileLang MIMO
+  kernels (mamba_ssm/ops/tilelang/mamba3/). The fused Mamba-2 output glue
+  (src/jla/layers/mamba2_fused.py) follows the RMSNormGated forward and
+  backward formulas of mamba_ssm/ops/triton/layernorm_gated.py. The
+  "upstream" initialisation of the Mamba-2 and Mamba-3 out_proj reimplements
+  _init_weights of mamba_ssm/models/mixer_seq_simple.py (kaiming_uniform_
+  with a = sqrt(5), divided by the square root of the number of residual
+  branches); no code was copied.
+
+* FlashQLA (https://github.com/QwenLM/FlashQLA)
+  Copyright (c) 2026 Qwen, Alibaba. MIT License (licenses/FlashQLA.LICENSE).
+  The fused Gated DeltaNet Mosaic GPU kernels follow the design of its Hopper
+  kernels (kkt_solve.py, fused_fwd.py, prepare_h.py and fused_bwd.py), and so
+  do the K = 256 kernels in src/jla/ops/mosaic_gpu/gated_delta_rule_kb.py. The
+  opt-in warm-up split (scalar_gate_docs.warmup_windows) ports get_warmup_chunks
+  from cp_fwd.py.
+
+* FlashKDA (https://github.com/MoonshotAI/FlashKDA)
+  Copyright (c) 2026 MoonshotAI. MIT License (licenses/FlashKDA.LICENSE).
+  The KDA / Gated DeltaNet-2 forward kernels adapt its tensor-core treatment of
+  bounded intra-chunk decays.
+
+* FLAT (https://github.com/trainstation-project/flat)
+  Copyright (c) 2026 Mayank Mishra. Apache License 2.0 (licenses/flat.LICENSE).
+  The fused short-convolution Mosaic GPU kernels
+  (src/jla/ops/mosaic_gpu/short_conv.py and short_conv_l2norm.py) adapt its
+  Pallas depthwise causal convolution
+  (flat/depthwise_causal_convolution/pallas_implementation/forward.py and
+  backward.py). The grouped simple-GLA backward (scalar_gate_grouped.py)
+  follows the packed-gradient design of flat/linear_attention/op.py (design
+  only, no code copied).
+
+* JAX (https://github.com/jax-ml/jax)
+  Copyright 2024-2025 The JAX Authors. Apache License 2.0 (licenses/jax.LICENSE).
+  The softmax attention kernels (src/jla/ops/mosaic_gpu/attention.py, the
+  persistent forward attention_persistent.py and the FP8 gradient epilogues
+  attention_fp8_bwd.py) adapt jax/experimental/pallas/ops/gpu/
+  attention_mgpu.py; the grouped GEMM (ragged dot) kernels adapt
+  ragged_dot_mgpu.py and transposed_ragged_dot_mgpu.py (and so does the FP8
+  grouped-GEMM forward, src/jla/ops/mosaic_gpu/ragged_dot_fp8.py, through the
+  persistent aligned schedule of ragged_dot.py); the Pallas Triton row
+  kernels of the fused Mamba-2 output glue (src/jla/layers/mamba2_fused.py)
+  adapt jax/experimental/pallas/ops/gpu/rms_norm.py; the fused SwiGLU GEMMs
+  (src/jla/ops/mosaic_gpu/fused_gemm.py), the fused LM-head cross entropy
+  (linear_cross_entropy.py), the warp-specialized grouped GEMM tiling
+  (ragged_dot.py) and benchmarks/bench_hopper_features.py adapt
+  hopper_matmul_mgpu.py (JAX 0.11.2), and the latter's launch check follows
+  tests/pallas/mosaic_gpu_test.py (test_griddepcontrol_multi_kernel). The
+  attention kernel's batch and head custom_partitioning rule follows
+  jax/_src/cudnn/fused_attention_stablehlo.py (design only, no code copied).
+
+* Tokamax (https://github.com/openxla/tokamax)
+  Copyright 2025 DeepMind Technologies Limited. Apache License 2.0
+  (licenses/tokamax.LICENSE).
+  The softmax attention backward kernels (src/jla/ops/mosaic_gpu/attention.py
+  and attention_fp8_bwd.py) adapt
+  tokamax/_src/ops/attention/pallas_mosaic_gpu_vjp_kernel_sm90.py, and
+  benchmarks/jax_tokamax_attention.py calls Tokamax as a benchmark baseline.
+  The attention kernel's named barriers (_named_barrier in src/jla/ops/
+  mosaic_gpu/attention.py: bar.arrive / bar.sync through inline_mgpu) adapt the
+  dynamic-barrier-id branch of _bar_operation in tokamax/_src/mosaic_gpu.py.
+  The grouped GEMM's aligned row-tile schedule (src/jla/ops/mosaic_gpu/
+  ragged_dot.py: 8-row-aligned group tiles, skipped empty tiles, the
+  stratified persistent grid) adapts tokamax/_src/ops/ragged_dot/
+  pallas_mosaic_gpu_kernel_sm90.py and pallas_mosaic_gpu_common.py.
+
+* FlashAttention (https://github.com/Dao-AILab/flash-attention)
+  Copyright (c) 2022, the respective contributors, as shown by its AUTHORS
+  file. BSD 3-Clause License (licenses/flash-attention.LICENSE).
+  The attention forward's intra-warpgroup overlap, warp-scheduler turns and
+  192 x 128 tiles for head dim 64 follow hopper/mainloop_fwd_sm90_tma_gmma_ws.hpp
+  and hopper/tile_size.h (design only, no code copied).
+  The attention forward's persistent tile loop, its longest-first tile order
+  inside L2-sized sections of (batch, head) pairs, its packed-document tiles
+  sorted by key-block count, and the next tile's query load issued once the
+  current tile's last QK^T has read the query tile follow
+  hopper/tile_scheduler.hpp, hopper/flash_fwd_kernel_sm90.h and
+  hopper/mainloop_fwd_sm90_tma_gmma_ws.hpp (design only, no code copied;
+  src/jla/ops/mosaic_gpu/attention_persistent.py).
+  The attention backward's block ranges and warpgroup layout follow
+  hopper/mainloop_bwd_sm90_tma_gmma_ws.hpp and hopper/block.h (design only, no
+  code copied), and so does the fused one-kernel backward
+  (backward="fused" in src/jla/ops/mosaic_gpu/attention.py: dS staged in
+  shared memory as the dQ operand, dQ split over the consumer warpgroups, fp32
+  dQ added with TMA reductions and rounded afterwards; design only, no code
+  copied). The attention backward's longest-first CTA order inside L2-sized
+  sections of (batch, head) pairs and its 24-register TMA warpgroup follow
+  hopper/tile_scheduler.hpp (SingleTileBwdLPTScheduler) and
+  hopper/flash_bwd_kernel_sm90.h (24 / 240 registers; design only, no code
+  copied; src/jla/ops/mosaic_gpu/attention.py and attention_fp8_bwd.py).
+  FlashAttention-3 is the attention baseline in
+  benchmarks/torch_fa3.py (run by benchmarks/bench_attention_fa3.py),
+  benchmarks/torch_fa3_mla.py (MLA's 192/128 head
+  dims; benchmarks/build_fa3_mla.sh builds it from source with those head
+  dims, setting its build flags only) and benchmarks/attention_fa3_diff.py, and the flame
+  baseline runs it through benchmarks/end_to_end/1p3b/flame/fa3_shim, which
+  re-exports its names and contains none of its code.
+
+* Transformer Engine (https://github.com/NVIDIA/TransformerEngine)
+  Copyright (c) NVIDIA CORPORATION & AFFILIATES. Apache License 2.0
+  (licenses/TransformerEngine.LICENSE).
+  The fused FP8 SwiGLU passes (src/jla/layers/fp8_swiglu.py) follow the design
+  of its fused cast-transpose and activation-cast kernels (design only, no code
+  copied).
+
+* MaxText (https://github.com/AI-Hypercomputer/maxtext)
+  Copyright Google LLC. Apache License 2.0 (licenses/maxtext.LICENSE).
+  The FP8 training recipe (src/jla/layers/fp8.py, src/jla/training/fp8.py)
+  adapts the GPU "fp8" recipe of src/maxtext/layers/quantizations.py, and
+  pipeline parallelism (src/jla/distributed/pipeline.py) adapts
+  src/maxtext/layers/pipeline.py. The pure-JAX Gated DeltaNet baseline in
+  benchmarks/maxtext_gdn.py is copied from it. The DPO options and defaults
+  (src/jla/training/dpo.py) follow src/maxtext/configs/post_train/dpo.yml, and
+  the preference-pair preprocessing (src/jla/data/preference.py: common-prefix
+  prompt extraction, left-truncated prompts, right-truncated responses) adapts
+  src/maxtext/input_pipeline/dpo_utils.py.
+
+* Flax (https://github.com/google/flax)
+  Copyright The Flax Authors. Apache License 2.0 (licenses/flax.LICENSE).
+  The delayed per-tensor FP8 scaling from an amax history in
+  src/jla/layers/fp8.py follows flax/linen/fp8_ops.py.
+
+* Hugging Face transformers (https://github.com/huggingface/transformers)
+  Copyright 2018- The Hugging Face team. Apache License 2.0
+  (licenses/transformers.LICENSE).
+  The Hugging Face import and export (src/jla/convert/hf_config.py and
+  hf_weights.py) follow its per-model configs and parameter layouts; the
+  Llama 3 and YaRN RoPE scaling (src/jla/layers/rope.py) adapts
+  modeling_rope_utils.py; the MiniMax-01 lightning attention
+  (src/jla/layers/lightning_attention.py) adapts models/minimax/
+  modular_minimax.py; and the MoE router (src/jla/layers/moe.py) adapts
+  models/deepseek_v3/modeling_deepseek_v3.py (DeepseekV3TopkRouter). The
+  mapping of Hugging Face's router_aux_loss_coef to ours
+  (jla.models.config.aux_loss_coef_from_hf / aux_loss_coef_to_hf) follows the
+  normalisation of load_balancing_loss_func in
+  models/qwen3_next/modeling_qwen3_next.py.
+
+* TRL (https://github.com/huggingface/trl)
+  Copyright 2020-2026 The HuggingFace Team. Apache License 2.0
+  (licenses/trl.LICENSE).
+  The SFT check for chat templates whose stop token is not trained
+  (src/jla/data/sft_tokenize.py) follows is_chat_template_stop_token_trained
+  in trl/chat_template_utils.py. The DPO losses (src/jla/training/dpo.py:
+  sigmoid, IPO on length-normalized log-ratios, hinge, and the reward
+  metrics) follow trl/trainer/dpo_trainer.py; benchmarks/dpo_trl_reference.py
+  runs TRL's DPOTrainer._compute_loss as the parity reference of
+  tests/test_dpo.py (tests/data/dpo_trl_reference.json holds its outputs).
+
+* flame (https://github.com/fla-org/flame)
+  Copyright (c) 2023-2025 Songlin Yang, Yu Zhang. MIT License
+  (licenses/flame.LICENSE).
+  The baseline model configs in benchmarks/end_to_end/1p3b/flame/*.json are
+  adapted from flame's configs/{transformer,gated_deltanet,mamba2}_1B.json
+  (the others take FLA's model-config defaults), and
+  benchmarks/bench_e2e_flame.py runs flame's trainer as the PyTorch
+  end-to-end baseline.
+
+* RWKV-LM (https://github.com/BlinkDL/RWKV-LM)
+  Copyright BlinkDL (Bo Peng) and contributors. Apache License 2.0
+  (licenses/RWKV-LM.LICENSE).
+  tests/test_rwkv7_official.py and benchmarks/torch_rwkv7_check.py transcribe
+  the RWKV-7 formulas of RWKV-v7/train_temp/src/model.py and
+  RWKV-v7/train_temp/cuda/rwkv7_clampw.cu as test oracles. The "upstream"
+  RWKV-7 initialisation was cross-checked against the same model.py (zero
+  LoRA downs, ortho_init of the LoRA ups with gain 0.1, zero att.output).
+
+* DeepSeek-V3 (https://github.com/deepseek-ai/DeepSeek-V3)
+  Copyright (c) 2023 DeepSeek. MIT License (licenses/DeepSeek-V3.LICENSE).
+  The Multi-head Latent Attention layer follows inference/model.py (class MLA),
+  and the group-limited, bias-corrected MoE routing (src/jla/layers/moe.py)
+  follows its Gate.
+
+* DeepSeek-V3.2-Exp (https://github.com/deepseek-ai/DeepSeek-V3.2-Exp)
+  Copyright (c) 2025 DeepSeek. MIT License (licenses/DeepSeek-V3.2-Exp.LICENSE).
+  The DeepSeek Sparse Attention indexer follows inference/model.py (Indexer).
+  The radix-select top-k kernel (src/jla/ops/mosaic_gpu/dsa_topk.py, our own
+  code) matches the top-k semantics and tie order of Indexer.forward, and the
+  optional FP8 indexer (SparseAttentionConfig.dsa_index_fp8) follows the
+  per-token FP8 scaling of inference/kernel.py (fp8_index_kernel).
+  The Mosaic GPU indexer kernel (src/jla/ops/mosaic_gpu/dsa.py) follows the
+  design of inference/kernel.py (fp8_index_kernel: per-head GEMM, ReLU, head
+  weights, sum), in bf16 (FP8 only with the option above); the indexer backward kernels and the
+  attention-target mode of that kernel are our own. benchmarks/dsa_reference_torch.py
+  adapts inference/model.py (Indexer.forward and the MHA prefill branch of
+  MLA.forward) as a test oracle; benchmarks/bench_dsa_deepseek.py runs
+  inference/kernel.py (act_quant, fp8_index; not included, loaded from a
+  user-given path) as a baseline. benchmarks/bench_dsa_production.py calls
+  DeepSeek's FlashMLA (https://github.com/deepseek-ai/FlashMLA, MIT) and DeepGEMM
+  (https://github.com/deepseek-ai/DeepGEMM, MIT) through their Python APIs as
+  baselines; their code is not included (see their entries below).
+
+* DeepGEMM (https://github.com/deepseek-ai/DeepGEMM)
+  Copyright (c) 2025 DeepSeek. MIT License (licenses/DeepGEMM.LICENSE).
+  benchmarks/bench_dsa_production.py calls its FP8 MQA-logits indexer
+  (fp8_fp4_mqa_logits, main 1fc9c66) through its Python API as a baseline;
+  the per-row FP8 cast of that benchmark mirrors the semantics of its
+  per_custom_dims_cast_to_fp8 (amax / 448). No code is included.
+
+* FlashMLA (https://github.com/deepseek-ai/FlashMLA)
+  Copyright (c) 2025 DeepSeek. MIT License (licenses/FlashMLA.LICENSE).
+  benchmarks/bench_dsa_production.py calls its sparse prefill
+  (flash_mla_sparse_fwd, commit ba89a34) through its Python API as a
+  baseline. src/jla/ops/dsa_gather.py's gather_attention follows the
+  selected-key formulation of that sparse prefill as plain JAX ops
+  (design only, no code copied). No code is included.
+
+* Liger Kernel (https://github.com/linkedin/Liger-Kernel)
+  Copyright 2024 LinkedIn Corporation. BSD 2-Clause License
+  (licenses/Liger-Kernel.LICENSE).
+  Forming the LM-head gradient in the forward pass
+  (linear_cross_entropy_objective in src/jla/ops/cross_entropy.py and
+  src/jla/ops/mosaic_gpu/linear_cross_entropy.py) follows the design of its
+  fused linear cross entropy (design only, no code copied), and
+  benchmarks/torch_cross_entropy.py calls LigerFusedLinearCrossEntropyLoss as
+  a baseline.
+
+* Cut Cross-Entropy (https://github.com/apple/ml-cross-entropy)
+  Copyright (C) 2024 Apple Inc. Apple software licence
+  (licenses/ml-cross-entropy.LICENSE).
+  benchmarks/torch_cross_entropy.py calls it as a baseline, and
+  benchmarks/cross_entropy.md discusses its block-skipping design. No code is
+  included.
+
+* CUTLASS (https://github.com/NVIDIA/cutlass)
+  Copyright (c) 2017 - 2025 NVIDIA CORPORATION & AFFILIATES. BSD 3-Clause
+  License (licenses/cutlass.LICENSE).
+  The persistent per-SM pipeline of the grouped GEMM
+  (src/jla/ops/mosaic_gpu/ragged_dot.py, the PERSISTENT tiling) follows its
+  persistent-kernel design as an idea only; no code was used.
+  benchmarks/torch_grouped_mm.py times torch._grouped_mm, which PyTorch builds
+  on CUTLASS, as the grouped-GEMM baseline.
+
+* MoBA (https://github.com/MoonshotAI/MoBA)
+  Copyright (c) 2025 Moonshot AI. MIT License (licenses/MoBA.LICENSE).
+  The MoBA attention op and its test oracle follow moba/moba_naive.py.
+
+* xLSTM (https://github.com/NX-AI/xlstm)
+  Copyright (c) NXAI GmbH and its affiliates 2024. Apache License 2.0
+  (licenses/xlstm.LICENSE).
+  The mLSTM layer layout follows xlstm/xlstm_large/model.py.
+
+Gated DeltaNet-2 is implemented from the equations of "Gated DeltaNet-2:
+Decoupling Erase and Write in Linear Attention" (Hatamizadeh, Choi and Kautz,
+arXiv:2605.22791). No code from its reference implementation is included.
+
+The mLSTM recurrence is implemented from the equations of "xLSTM: Extended Long
+Short-Term Memory" (arXiv:2405.04517) and the xLSTM 7B paper (arXiv:2503.13427).
+No code from NX-AI/mlstm_kernels is included: benchmarks/torch_mlstm.py and
+benchmarks/torch_upstream_diff.py call its public API as an optional baseline
+from a separate environment (its NXAI Community License is not a permissive
+licence).
+
+The following projects are named in the documentation or run only as
+benchmark baselines from separate environments; no code from them is included
+or adapted: PyTorch (BSD-3-Clause), causal-conv1d (BSD-3-Clause), cuDNN
+(through JAX and PyTorch), Triton (the language of the FLA, Mamba and TFLA
+baselines), torchtitan (the trainer library under the flame baseline),
+grouped_gemm (https://github.com/tgale96/grouped_gemm, the CUTLASS grouped GEMM
+that MegaBlocks uses; an optional baseline of benchmarks/bench_ragged_dot.py) and
+MegaBlocks, Megatron-Core, quack, ThunderKittens and TileLang (TileLang runs
+the official Mamba-3 MIMO kernels in the Mamba-3 MIMO baseline). The kimi-linear-1p3b and qwen3-next-1p3b
+presets copy hyperparameters (field values only, no code or weights) from the
+config.json files of moonshotai/Kimi-Linear-48B-A3B-Instruct and
+Qwen/Qwen3-Next-80B-A3B-Instruct on the Hugging Face Hub.
+
+The optional extras install and call these packages through their public APIs
+only (none of their code is included): lm-evaluation-harness (jla eval
+lm-eval, src/jla/eval/lm_eval_adapter.py), Orbax, Hugging Face datasets,
+PyArrow, jinja2, Weights & Biases and tensorboardX. The runtime dependencies
+(JAX and jaxlib with XLA and the CUDA libraries they bring, such as cuDNN,
+cuBLAS and cuBLASLt, CUB, NCCL and CUPTI; Optax; NumPy) are likewise used
+through their public APIs and keep their own licences. runtime.cluster_env reads the environment variables
+of the SLURM, Open MPI and torchrun launchers; the benchmarks record NVIDIA's
+nvidia-smi output, and benchmarks/kda.md and benchmarks/attention.md name
+Nsight (not used).
+
+The end-to-end benchmarks train on FineWeb-Edu
+(https://huggingface.co/datasets/HuggingFaceFW/fineweb-edu, ODC-By 1.0)
+tokenized with Meta's Llama 3 tokenizer (128,256 ids, as shipped with Llama 3.1
+and 3.2 under their community licences). Neither the data nor the tokenizer
+is included.

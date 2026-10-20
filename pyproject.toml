@@ -1,0 +1,64 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "jax-linear-attention"
+dynamic = ["version"]
+description = "A JAX LLM training template with Pallas Mosaic GPU kernels for linear attention, state-space models and softmax attention on NVIDIA Hopper"
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE", "licenses/*"]
+requires-python = ">=3.12"
+authors = [{ name = "KarLex AI, Inc." }]
+keywords = [
+    "jax", "pallas", "mosaic-gpu", "linear-attention", "state-space-models",
+    "mamba", "gated-deltanet", "kda", "rwkv", "llm-training",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: GPU :: NVIDIA CUDA :: 13",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "jax==0.11.2",
+    "equinox>=0.13",
+    "optax>=0.2.8",
+    "numpy>=2",
+    "safetensors>=0.4",
+]
+
+[project.urls]
+Homepage = "https://github.com/jla-org/jax-linear-attention"
+Repository = "https://github.com/jla-org/jax-linear-attention"
+Issues = "https://github.com/jla-org/jax-linear-attention/issues"
+Changelog = "https://github.com/jla-org/jax-linear-attention/blob/main/CHANGELOG.md"
+Documentation = "https://github.com/jla-org/jax-linear-attention/tree/main/docs"
+
+[project.optional-dependencies]
+cuda = ["jax[cuda13]==0.11.2"]
+orbax = ["orbax-checkpoint"]
+tokenize = ["transformers", "jinja2"]
+stream = ["datasets", "pyarrow"]
+loggers = ["wandb", "tensorboardX"]
+eval = ["lm-eval"]
+test = ["pytest>=8"]
+
+[project.scripts]
+jla = "jla.cli:main"
+jla-graph-health = "jla.training.graph_health:main"
+
+[tool.setuptools.dynamic]
+version = { attr = "jla.__version__" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

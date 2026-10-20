@@ -1,0 +1,26 @@
+# The JAX 0.11.2 CUDA 13 stack of the 0.1.0 test and benchmark environment (H100).
+# Use as a constraints file:  pip install -e ".[cuda,test]" -c requirements/jax-0.11.2-cuda13.txt
+equinox==0.13.8
+jax==0.11.2
+jax-cuda13-pjrt==0.11.2
+jax-cuda13-plugin==0.11.2
+jaxlib==0.11.2
+ml-dtypes==0.6.0
+numpy==2.5.4
+nvidia-cublas==13.8.1.7
+nvidia-cuda-cccl==13.3.4.3.1
+nvidia-cuda-crt==13.4.92
+nvidia-cuda-cupti==13.4.92
+nvidia-cuda-nvcc==13.4.92
+nvidia-cuda-nvrtc==13.4.92
+nvidia-cuda-runtime==13.4.92
+nvidia-cudnn-cu13==9.27.0.42
+nvidia-cufft==12.4.0.43
+nvidia-cusolver==12.3.5.3
+nvidia-cusparse==12.8.6.72
+nvidia-nccl-cu13==2.32.3
+nvidia-nvjitlink==13.4.92
+nvidia-nvshmem-cu13==3.8.0
+nvidia-nvvm==13.4.92
+optax==0.2.8
+safetensors==0.8.0

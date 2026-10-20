@@ -1,0 +1,66 @@
+# Copyright 2026 KarLex AI, Inc.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Transformer baseline at 1.3B for the training-throughput setting of the Gated DeltaNet-2 paper (arXiv 2605.22791,
+# Fig. 2 and App. E.1): 24 blocks of [global causal attention, MLP] at d_model 2048, the attention of the hybrids in
+# this directory without the window (32 query heads of 64, 8 KV heads, RoPE 1e4, no QK-norm), SwiGLU width 6272 so
+# that the model has 1.31B parameters with a 32,000-token vocabulary. Synthetic uniform token ids without document
+# masking, bf16 compute, no activation recompute. run.sh in this directory runs it at 2K x 8, 4K x 4, 8K x 2 and
+# 16K x 1 (16,384 tokens per step) on one GPU.
+name = "gdn2-paper-transformer"
+
+[model]
+vocab_size = 32000
+d_model = 2048
+n_layers = 24
+d_ff = 6272
+tie_embeddings = false
+norm_eps = 1e-6
+remat = "none"
+lean_vjp = true
+scan_layers = false
+
+[model.attention]
+num_heads = 32
+num_kv_heads = 8
+head_dim = 64
+rope_theta = 10000.0
+qk_norm = false
+
+[optim]
+name = "adamw"
+lr = 4e-4
+schedule = "cosine"
+warmup_steps = 5
+min_lr_ratio = 0.1
+b1 = 0.9
+b2 = 0.95
+weight_decay = 0.1
+max_grad_norm = 1.0
+
+[train]
+max_steps = 30
+seq_len = 4096
+micro_batch_per_replica = 4
+grad_accum = 1
+z_loss = 0.0
+ce_impl = "auto"
+log_every = 1
+eval_every = 0
+final_eval = false
+save_every = 0
+save_final = false
+output_dir = "runs/gdn2-paper-transformer"
+
+[data]
+source = "synthetic"
+synthetic_kind = "uniform"
+document_masking = false
+
+[mesh]
+dp = 1
+fsdp = -1
+tp = 1
+
+[runtime]
+xla_tuning_level = 1

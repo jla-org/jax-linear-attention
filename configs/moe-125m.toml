@@ -1,0 +1,50 @@
+# Copyright 2026 KarLex AI, Inc.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Sparse MoE decoder: 16 SwiGLU experts, top-2 plus one shared expert
+# (~125M active parameters). The router's balance and z-losses arrive through
+# LMOutput.aux_loss. Expert weights are sharded like dense ones (embed over
+# fsdp); to place whole experts on devices instead, set
+#   [mesh.rules]
+#   experts = ["fsdp"]
+
+name = "moe-125m"
+
+[model]
+preset = "moe-125m"
+
+[optim]
+name = "adamw"
+lr = 6e-4
+schedule = "wsd"
+warmup_steps = 2000
+stable_fraction = 0.8
+min_lr_ratio = 0.1
+b2 = 0.95
+weight_decay = 0.1
+max_grad_norm = 1.0
+
+[train]
+max_steps = 50000
+seq_len = 2048
+micro_batch_per_replica = 16
+grad_accum = 1
+z_loss = 1e-4
+log_every = 50
+eval_every = 1000
+eval_batches = 50
+save_every = 2000
+output_dir = "runs/moe-125m"
+
+[data]
+source = "cidx"
+paths = ["/path/to/corpus/train"]  # placeholder: a `jla tokenize` output prefix
+eval_holdout_records = 4096
+num_workers = 4
+prefetch = 8
+
+[mesh]
+fsdp = -1
+
+[runtime]
+xla_tuning_level = 1

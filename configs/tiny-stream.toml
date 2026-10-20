@@ -1,0 +1,41 @@
+# Copyright 2026 KarLex AI, Inc.
+# SPDX-License-Identifier: Apache-2.0
+#
+# The "tiny" preset trained directly on raw text: JSONL documents are tokenized
+# (UTF-8 bytes here, or any Hugging Face tokenizer) and packed on the fly.
+#   python -m jla.cli train --config configs/tiny-stream.toml --set 'data.stream_files=["train.jsonl"]'
+# Each line of the JSONL files is an object with a "text" field. Metrics go to
+# metrics.jsonl; add "tensorboard" (optional 'tensorboardX' package) or "wandb"
+# (optional 'wandb' package, with train.wandb_project) to train.loggers for more sinks.
+
+name = "tiny-stream"
+
+[model]
+preset = "tiny"            # vocab 512: bytes 0-255 plus EOS 256
+compute_dtype = "float32"  # bfloat16 matmuls are slow on CPU
+
+[optim]
+name = "adamw"
+lr = 3e-3
+schedule = "cosine"
+warmup_steps = 10
+weight_decay = 0.0
+
+[train]
+max_steps = 200
+seq_len = 256
+micro_batch_per_replica = 8
+grad_accum = 1
+log_every = 20
+final_eval = false         # stream evaluation reads a CIDX corpus: set data.eval_path to enable
+save_every = 100
+output_dir = "runs/tiny-stream"
+loggers = ["jsonl"]
+
+[data]
+source = "stream"
+stream_files = ["train.jsonl"]
+tokenizer = "byte"
+eos_id = 256
+packing = "first_fit"      # or "concat_split" (the windows of the pre-tokenized path)
+document_masking = true

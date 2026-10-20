@@ -1,0 +1,63 @@
+# Copyright 2026 KarLex AI, Inc.
+# SPDX-License-Identifier: Apache-2.0
+#
+# benchmarks/end_to_end_1p3b.md: preset qwen3-next-1p3b, seq 4096 with document masking on FineWeb-Edu
+# tokenized with the Llama-3.1 tokenizer (128,256 ids, EOS 128001) in 4096-token packed CIDX records.
+# One H100: micro_batch_per_replica 16 x 4096 = 65,536 tokens per step. Under FSDP each GPU dispatches its own
+# tokens to the dropless MoE (jla.layers.moe; routing every GPU's tokens on every GPU does not fit): FSDP 8
+# trains it at 71.9k tokens/s per GPU (19 Oct 2026, the cross entropy below).
+# Also measured on 8 GPUs: expert parallelism with
+# bounded blocks: --set mesh.fsdp=1 --set mesh.ep=8 --set 'model.moe.expert_parallel_axis="ep"'
+# --set model.moe.expert_parallel_buffer_factor=2.0 --set train.micro_batch_per_replica=8 --set train.grad_accum=2
+# Run it with benchmarks/bench_e2e_1p3b.py (sets data.paths and the timing settings) or with
+#   jla train --config benchmarks/end_to_end/hybrids_1p3b/qwen3-next-1p3b.toml --set 'data.paths=["/path/to/fineweb_edu_3B"]'
+name = "e2e-qwen3-next-1p3b"
+
+[model]
+preset = "qwen3-next-1p3b"
+
+[optim]
+name = "adamw"
+lr = 3e-4
+schedule = "cosine"
+warmup_steps = 5
+min_lr_ratio = 0.1
+b1 = 0.9
+b2 = 0.95
+weight_decay = 0.1
+max_grad_norm = 1.0
+
+[train]
+max_steps = 20
+seq_len = 4096
+micro_batch_per_replica = 16
+grad_accum = 1
+z_loss = 0.0
+# The LM head's and the MTP heads' gradients formed in the forward pass (needs ce_impl "auto" or "mosaic_gpu"):
+# 1.118x on one H100 and 1.112x on 8 GPUs (FSDP 8) in A/B runs against the XLA cross entropy, with the 20-step
+# loss equal within 2e-4 (benchmarks/end_to_end_1p3b.md; 19 Oct 2026, provisional).
+ce_impl = "auto"
+ce_grad_in_forward = true
+log_every = 1
+eval_every = 0
+final_eval = false
+save_every = 0
+save_final = false
+output_dir = "runs/e2e-qwen3-next-1p3b"
+
+[data]
+source = "cidx"
+paths = ["/path/to/fineweb_edu_3B"]  # the CIDX prefix: bench_e2e_1p3b.py --data, or --set data.paths=[...]
+exact_packed_records = true
+eos_id = 128001
+document_masking = true
+num_workers = 4
+prefetch = 8
+
+[mesh]
+dp = 1
+fsdp = -1  # one GPU (see above)
+tp = 1
+
+[runtime]
+xla_tuning_level = 1

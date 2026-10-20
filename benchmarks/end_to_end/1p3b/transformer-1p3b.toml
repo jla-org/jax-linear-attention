@@ -1,0 +1,111 @@
+# Copyright 2026 KarLex AI, Inc.
+# SPDX-License-Identifier: Apache-2.0
+#
+# benchmarks/end_to_end_1p3b.md: preset transformer-1p3b, seq 4096 with document masking on FineWeb-Edu
+# tokenized with the Llama-3.1 tokenizer (128,256 ids, EOS 128001) in 4096-token packed CIDX records.
+# micro_batch_per_replica 4 x grad_accum 4 x 4096 = 65,536 tokens per GPU, 524,288 tokens per step on 8 GPUs.
+# Run it with benchmarks/bench_e2e_1p3b.py (sets data.paths and the timing settings) or with
+#   jla train --config benchmarks/end_to_end/1p3b/transformer-1p3b.toml --set 'data.paths=["/path/to/fineweb_edu_3B"]'
+name = "e2e-transformer-1p3b"
+
+[model]
+preset = "transformer-1p3b"
+# No recompute, lean VJPs and unrolled layers at 4 x 4096 x grad_accum 4 (65,536 tokens per step as before;
+# benchmarks/fp8_1p3b.md): 1.128x and 1.114x the step of full remat at 16 x 4096 x 1 in two interleaved
+# pairs on one H100 (bf16, 18 Oct 2026, provisional), peak 50.4 GiB against 36.0 GiB; this file as then written
+# (before the [train] cross-entropy settings) ran at 53,497 tok/s (50.2% MFU) against 45,417-48,113 for full
+# remat. With the scanned layers the same split is 0.96x (the scan stacks every layer's residuals and launches
+# the attention forward twice).
+# With FP8 (fp8 = "delayed", fp8_min_features = 512, fp8_fused = true) it is 1.01-1.02x. On 8 GPUs (FSDP over 8,
+# bf16) it measured 1.102x and 1.087x (392,900 and 375,678 tok/s against 356,374 and 345,667, peak 28.6 GiB
+# per GPU against 14.9). The previous setting (full remat at 16 x 4096):
+#   --micro-batch 16 --grad-accum 1 --set 'model.remat="full"' --set model.lean_vjp=false --set model.scan_layers=true
+remat = "none"
+lean_vjp = true
+scan_layers = false
+
+[model.attention]
+# The Mosaic GPU kernel, pinned: train.grad_reduce = "step" below refuses "auto" on GPUs (with packed documents on
+# an H100 "auto" picks this kernel anyway). Its persistent forward (one CTA per SM; on with persistent_forward
+# unset) is not slower on 8 GPUs than one CTA per tile (FSDP 8, FP8, grad_reduce = "step": 1.020x and 0.998x in
+# two interleaved pairs, the first pair's one-CTA-per-tile run with three slow steps; benchmarks/
+# benchmarks/multi_gpu.md, 19 Oct 2026, provisional), so it stays on there too.
+implementation = "mosaic_gpu"
+# The fused backward of the Mosaic GPU attention kernel (one kernel for dq, dk and dv; benchmarks/attention.md,
+# "Fused backward end to end"): 1.014x end to end in bf16 against the ranged pair, faster in both interleaved pairs on one
+# H100 (18 Oct 2026, provisional; the throughput figures above were measured with "ranged"). Its dq is added up
+# in fp32 by TMA reductions, so runs are not bitwise reproducible; "ranged" (the library default) is.
+mosaic_gpu_backward = "fused"
+# With FP8 (fp8 = "delayed" and the train step's weight copies; no effect without FP8) the attention backward
+# kernels write the q/k/v projections' e5m2 gradients and their amaxes (benchmarks/fp8_1p3b.md, "The recipe
+# and the fused paths"): 1.011x on one H100 in an interleaved A/B (70.71-70.74% MFU by wall
+# clock; 19 Oct 2026, provisional). On 8 GPUs (FSDP 8, grad_reduce = "step"), where it runs per shard: 1.038x
+# and 1.013x in two interleaved pairs (72,767 and 72,981 against 70,082 and 72,054 tok/s per GPU; the same losses
+# and memory), so it stays on there too.
+fp8_grad_epilogue = true
+
+[optim]
+name = "adamw"
+lr = 3e-4
+schedule = "cosine"
+warmup_steps = 5
+min_lr_ratio = 0.1
+b1 = 0.9
+b2 = 0.95
+weight_decay = 0.1
+max_grad_norm = 1.0
+
+[train]
+max_steps = 20
+seq_len = 4096
+micro_batch_per_replica = 4  # x grad_accum 4 = 65,536 tokens per GPU (see [model])
+grad_accum = 4
+scan_unroll = 1  # a rolled micro-step loop: unrolled, XLA keeps several micro-steps' activations alive
+z_loss = 0.0
+# The LM head's gradient formed in the forward pass (benchmarks/cross_entropy.md, "Training at 1.3B"; it
+# needs ce_impl "auto" or "mosaic_gpu"): 1.105x in bf16 and 1.088x in FP8 on one H100 in interleaved A/B runs
+# against ce_impl "xla", 1.114x on 8 GPUs (FSDP 8, FP8), with the 20-step loss inside the spread of
+# repeated runs; peak memory +4.4 GiB on one GPU and +6.3 GiB per GPU on 8 (benchmarks/cross_entropy.md,
+# "Training at 1.3B"; 18 Oct 2026, provisional).
+ce_impl = "auto"
+ce_grad_in_forward = true
+# Dispatch the next step before reading a step's metrics, and apply the rejected-step rule as an elementwise
+# select instead of lax.cond, so that on several GPUs the host does not wait for each step's gradient norm
+# (src/jla/config.py; benchmarks/multi_gpu.md). Measured in FP8 (19 Oct 2026, provisional): on one
+# H100, dispatch_ahead 1.003-1.013x and the select no change (881 against 877 ms); on 2 GPUs (FSDP 2, both arms
+# dispatching ahead) the select 1.061x; on 8 GPUs (FSDP 8) with this release's attention kernels the two
+# without "step" ran at 68,626-68,695 tok/s per GPU (64.4% MFU), against 61,737 (57.9%) for the TOML before them.
+# One gradient reduction per step (train.grad_reduce = "step": each GPU runs its micro-steps on its own rows as one
+# GPU does, then one reduce-scatter per step; it needs the Mosaic GPU attention pinned above): on 8 GPUs (FSDP 8,
+# FP8) 1.060x and 1.064x the per-micro-step reduction in two interleaved pairs (72,751 and 73,104 against 68,626
+# and 68,695 tok/s per GPU; 68.2-68.6% against 64.4% MFU), with the losses inside the spread of repeated runs
+# (step 20: 7.844-7.861 over six runs of this setting, 7.859 and 7.862 per micro-step) and 38.3 against 34.4 GiB per GPU
+# at peak (benchmarks/multi_gpu.md, "Train options for several GPUs"; 19 Oct 2026, provisional).
+# It keeps about 10 bytes per parameter on every GPU whatever the FSDP size, so it suits models up to about 3B;
+# on one GPU it is the plain step.
+grad_reduce = "step"
+dispatch_ahead = true
+update_guard = "select"
+log_every = 1
+eval_every = 0
+final_eval = false
+save_every = 0
+save_final = false
+output_dir = "runs/e2e-transformer-1p3b"
+
+[data]
+source = "cidx"
+paths = ["/path/to/fineweb_edu_3B"]  # the CIDX prefix: bench_e2e_1p3b.py --data, or --set data.paths=[...]
+exact_packed_records = true
+eos_id = 128001
+document_masking = true
+num_workers = 4
+prefetch = 8
+
+[mesh]
+dp = 1
+fsdp = -1
+tp = 1
+
+[runtime]
+xla_tuning_level = 1
