@@ -56,8 +56,7 @@ from jla.ops.mosaic_gpu._common import (
     iota,
     matmul,
     same_run,
-    smem,
-)
+    smem, mma, mma_acc, products, tc_group, is_blackwell, prestaged, stage_into)
 from jla.ops.mosaic_gpu.scalar_gate_fused import _stages
 
 Array = jax.Array
@@ -79,12 +78,7 @@ def _products(*specs) -> tuple[Array, ...]:
     previous one finishes instead of draining between them.
     """
 
-    def scoped(*accs):
-        for acc, (a, b, _) in zip(accs, specs):
-            plgpu.wgmma(acc, a, b)
-        return tuple(acc[...] for acc in accs)
-
-    return lax.optimization_barrier(pl.run_scoped(scoped, *(plgpu.ACC(shape, F32) for _, _, shape in specs)))
+    return products(*specs)
 
 
 def state_fwd_wy(
@@ -190,6 +184,7 @@ def state_fwd_wy(
         wg = lax.axis_index("wg")
 
         @pl.when(wg == 2)
+        @tc_group(2)
         def _memory():
             plgpu.set_max_registers(40, action="decrease")
 
@@ -216,6 +211,7 @@ def state_fwd_wy(
                 issue(n, slot)
 
         @pl.when(wg == 1)
+        @tc_group(1)
         def _ag():
             plgpu.set_max_registers(232, action="increase")
 
@@ -236,6 +232,7 @@ def state_fwd_wy(
                 plgpu.barrier_arrive(in_free.at[slot])
 
         @pl.when(wg == 0)
+        @tc_group(0)
         def _state():
             plgpu.set_max_registers(232, action="increase")
             shape = (bv, key_dim)
@@ -260,6 +257,7 @@ def state_fwd_wy(
                     h_out.at[half][...] = s_lo
                     plgpu.commit_smem()
                     plgpu.copy_smem_to_gmem(h_out.at[half], h_ref.at[b, hh, c0 + n, pl.ds(v0, bv)])
+                    s_lo = prestaged(s_lo, h_out.at[half])  # Blackwell: the MMA reads the stored tile (no restaging)
                 g_last = g_state[slot, C - 1]
                 g_col = plgpu.load(g_state.at[slot], layout=COLS)
                 key_decay = jnp.exp2(g_col)
@@ -404,6 +402,7 @@ def state_bwd_wy(
         sq = (C, C)
 
         @pl.when(wg == 2)
+        @tc_group(2)
         def _memory():
             plgpu.set_max_registers(40, action="decrease")
 
@@ -431,6 +430,7 @@ def state_bwd_wy(
                 issue(i, slot)
 
         @pl.when(wg == 1)
+        @tc_group(1)
         def _intra():
             plgpu.set_max_registers(232, action="increase")
 
@@ -459,6 +459,7 @@ def state_bwd_wy(
                 plgpu.barrier_arrive(in_free.at[slot])
 
         @pl.when(wg == 0)
+        @tc_group(0)
         def _state():
             plgpu.set_max_registers(232, action="increase")
             if has_dht:
@@ -477,7 +478,10 @@ def state_bwd_wy(
                 ds_lo = ds_t.astype(dtype)
                 if store_grads:
                     plgpu.wait_smem_to_gmem(1, wait_read_only=True)  # dh_out/dv_out[half] of step i - 2 were sent
-                    dh_out.at[half][...] = ds_lo
+                    if is_blackwell():  # store and commit now: the MMA below reads the tile (no restaging)
+                        ds_lo = stage_into(ds_lo, dh_out.at[half])
+                    else:
+                        dh_out.at[half][...] = ds_lo
                 g_last = g_state[slot, C - 1]
                 g_col = plgpu.load(g_state.at[slot], layout=COLS)  # tokens are the columns of the [BV, C] tiles
                 k_decay = jnp.exp2(g_last - g_col)
@@ -504,10 +508,10 @@ def state_bwd_wy(
                 dwn = (dw_t * bcast_cols(-gam, st)).astype(dtype)
 
                 def update(acc):
-                    plgpu.wgmma(acc, do_t, q_s.at[slot])
-                    plgpu.wgmma(acc, dwn, k_s.at[slot])
+                    mma(acc, do_t, q_s.at[slot])
+                    mma(acc, dwn, k_s.at[slot])
 
-                ds_new = lax.optimization_barrier(pl.run_state(update)(plgpu.ACC.init(ds_t * s_decay)))
+                ds_new = lax.optimization_barrier(mma_acc(update, ds_t * s_decay))
                 plgpu.barrier_arrive(in_free.at[slot])
                 return ds_new
 
@@ -670,6 +674,7 @@ def chunk_grads(
                 plgpu.set_max_registers(n, action="increase" if n > CHUNK_GRADS_LAUNCH_REGISTERS else "decrease")
 
         @pl.when(wg == 0)
+        @tc_group(0)
         def _forward_side():
             set_registers(CHUNK_GRADS_REGISTERS[0])
             loads = [(k_ref.at[b, rows, hk], k_s), (h_ref.at[b, hh, n], h_s), (v_ref.at[b, rows, hh], v_s),
@@ -696,7 +701,7 @@ def chunk_grads(
             plgpu.commit_smem()
             plgpu.barrier_arrive(ag_ready)
             for blk in vblocks:
-                vn_s.at[:, blk][...] = matmul(ag_lo, w_s.at[:, blk], sh).astype(dtype)
+                vn_s.at[:, blk][...] = matmul(prestaged(ag_lo, ag_s), w_s.at[:, blk], sh).astype(dtype)
             plgpu.commit_smem()
             plgpu.barrier_arrive(vn_ready)
             plgpu.barrier_wait(in_b)
@@ -714,7 +719,7 @@ def chunk_grads(
             # dq = scale Gamma (do S^T) + dP k
             dq = matmul(do_s, h_s, sk) * bcast_rows(gam * scale, sk)
             dg = dg + (plgpu.load(q_s, layout=WGMMA).astype(F32) * dq).sum(axis=1)
-            dq = matmul(dp_lo, k_s, sk, init=dq)
+            dq = matmul(prestaged(dp_lo, dp_s), k_s, sk, init=dq)
             plgpu.barrier_wait(do_free)  # WG1 has read do
             dq_out[...] = dq.astype(dtype)
             plgpu.commit_smem()
@@ -735,6 +740,7 @@ def chunk_grads(
             return k_decay, s_decay
 
         @pl.when(wg == 1)
+        @tc_group(1)
         def _backward_side():
             set_registers(CHUNK_GRADS_REGISTERS[1])
             plgpu.barrier_wait(in_a)
@@ -744,6 +750,7 @@ def chunk_grads(
             k_decay, _ = key_decay()
             # dv_new = scale P^T do + Gamma_r (k dS')
             pt = (matmul(k_s, q_s.T, sq) * decay_t(g_row, g_col, runs) * scale).astype(dtype)
+            pt = stage_into(pt, m_s)  # Blackwell: m_s is free until this warpgroup writes M below
             for blk in vblocks:
                 dvl, kds = _products((pt, do_s.at[:, blk], sh), (k_s, dh_s.at[blk].T, sh))
                 dvn_s.at[:, blk][...] = (kds * bcast_rows(k_decay, sh) + dvl).astype(dtype)
@@ -766,7 +773,7 @@ def chunk_grads(
             # part (T0 has a unit diagonal); dA0 beta_i then replaces M in m_s.
             strict = iota(sq, 0) > iota(sq, 1)
             ndt = jnp.where(strict, dag * decay * bcast_cols(-b_col, sq), 0.0)
-            m_s[...] = matmul(ndt.astype(dtype), t_s.T, sq).astype(dtype)
+            m_s[...] = matmul(stage_into(ndt.astype(dtype), m_s), t_s.T, sq).astype(dtype)
             plgpu.commit_smem()
             if segs:
                 strict = strict & same_run(runs, sq)
@@ -794,6 +801,7 @@ def chunk_grads(
             plgpu.wait_smem_to_gmem(0)
 
         @pl.when(wg == 2)
+        @tc_group(2)
         def _key_side():
             set_registers(CHUNK_GRADS_REGISTERS[2])
             plgpu.barrier_wait(in_a)
@@ -809,26 +817,32 @@ def chunk_grads(
                 sd = part if sd is None else sd + part
             # dk, starting from its state part Gamma_r (v_new dS'^T), whose key products feed the gate gradient.
             plgpu.barrier_wait(vn_ready)
-            vnr = [(plgpu.load(vn_s.at[:, blk], layout=WGMMA).astype(F32) * bcast_rows(k_decay, sh)).astype(dtype)
-                   for blk in vblocks]
+            if is_blackwell():  # Gamma_r (v_new dS'^T) with the row decay applied to the product (no staging)
+                def state_part(acc):
+                    mma(acc, vn_s, dh_s)  # all value blocks at once: K = V
 
-            def state_part(acc):
-                for blk, a in zip(vblocks, vnr):
-                    plgpu.wgmma(acc, a, dh_s.at[blk])
+                dks = lax.optimization_barrier(mma_acc(state_part, jnp.zeros(sk, F32))) * bcast_rows(k_decay, sk)
+            else:
+                vnr = [(plgpu.load(vn_s.at[:, blk], layout=WGMMA).astype(F32) * bcast_rows(k_decay, sh)).astype(dtype)
+                       for blk in vblocks]
 
-            dks = lax.optimization_barrier(pl.run_state(state_part)(plgpu.ACC.init(jnp.zeros(sk, F32))))
+                def state_part(acc):
+                    for blk, a in zip(vblocks, vnr):
+                        mma(acc, a, dh_s.at[blk])
+
+                dks = lax.optimization_barrier(mma_acc(state_part, jnp.zeros(sk, F32)))
             rks = (plgpu.load(k_s, layout=WGMMA).astype(F32) * dks).sum(axis=1)
 
             def update(acc):
                 plgpu.barrier_wait(dw_ready)
-                plgpu.wgmma(acc, dvn_s, h_s)  # -Gamma (dW S^T)
+                mma(acc, dvn_s, h_s)  # -Gamma (dW S^T)
                 plgpu.barrier_wait(dp_ready)
-                plgpu.wgmma(acc, dp_s.T, q_s)  # dP^T q
+                mma(acc, dp_s.T, q_s)  # dP^T q
                 plgpu.barrier_wait(das_ready)
-                plgpu.wgmma(acc, m_s, k_s)
-                plgpu.wgmma(acc, m_s.T, k_s)
+                mma(acc, m_s, k_s)
+                mma(acc, m_s.T, k_s)
 
-            dk = lax.optimization_barrier(pl.run_state(update)(plgpu.ACC.init(dks)))
+            dk = lax.optimization_barrier(mma_acc(update, dks))
             dk_out[...] = dk.astype(dtype)  # W was last read by WG1's dAg product (before dw_ready)
             plgpu.commit_smem()
             plgpu.copy_smem_to_gmem(dk_out, dk_ref.at[b, rows, hh])

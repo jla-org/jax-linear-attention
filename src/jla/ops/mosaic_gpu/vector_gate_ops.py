@@ -20,7 +20,7 @@ import jax.numpy as jnp
 
 from jla.ops.mosaic_gpu import vector_gate as vg
 from jla.ops.mosaic_gpu import vector_gate_bwd as vgb
-from jla.ops.mosaic_gpu._common import MAX_GRID_YZ
+from jla.ops.mosaic_gpu._common import MAX_GRID_YZ, blackwell_enabled, is_blackwell
 from jla.ops.reference import l2norm, segment_resets
 
 Array = jax.Array
@@ -64,6 +64,9 @@ def _forward_state_config(cfg: vg.Config, *, fused: bool) -> vg.Config:
         block_v = 64
     else:
         block_v = 128
+    if is_blackwell():
+        # tcgen05: each N half of an M=64 MMA holds whole 32-element swizzle atoms, so value tiles are >= 64 wide.
+        block_v = max(block_v, 64)
     return dataclasses.replace(cfg, block_v=min(block_v, cfg.value_dim))
 
 
@@ -262,7 +265,8 @@ _OPTIONS = frozenset({"scale", "initial_state", "output_final_state", "use_qk_l2
 def unsupported_reason(q: Array, k: Array, v: Array, g: Array, gates_ok: bool, options: dict) -> str | None:
     """Why the KDA / GDN-2 kernels cannot run this call (``None`` if they can).
 
-    ``gates_ok`` says whether the gate shapes are right. The kernels need sm_90, bf16 ``q, k, v``,
+    ``gates_ok`` says whether the gate shapes are right. The kernels need sm_90 (or a Blackwell GPU with
+    ``JLA_BLACKWELL=1``), bf16 ``q, k, v``,
     ``K, V`` in {64, 128}, ``H * K`` a multiple of 128, ``T >= 1``, chunk 64 / sub-chunk 16, integer
     ``segment_ids [B, T]`` or none, and no ``cu_seqlens``.
     """
@@ -271,8 +275,8 @@ def unsupported_reason(q: Array, k: Array, v: Array, g: Array, gates_ok: bool, o
         return f"unsupported options {extra}"
     if not gates_ok:
         return "the gate shapes do not match q and v"
-    if not is_hopper():
-        return "the kernels need an sm_90 (Hopper) GPU"
+    if not (is_hopper() or blackwell_enabled()):
+        return "the kernels need an sm_90 (Hopper) GPU, or a Blackwell GPU with JLA_BLACKWELL=1"
     if options.get("cu_seqlens") is not None:
         return "the kernels take segment_ids, not cu_seqlens"
     if options.get("chunk_size", vg.CHUNK) != vg.CHUNK or options.get("sub_chunk", vg.SUB_CHUNK) != vg.SUB_CHUNK:

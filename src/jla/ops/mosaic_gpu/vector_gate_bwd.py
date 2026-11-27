@@ -30,7 +30,7 @@ import jax.experimental.pallas.mosaic_gpu as plgpu
 import jax.numpy as jnp
 from jax import lax
 
-from jla.ops.mosaic_gpu._common import finish_together
+from jla.ops.mosaic_gpu._common import finish_together, products, tc_group
 from jla.ops.mosaic_gpu.vector_gate import (
     CHUNK,
     SUB_CHUNK,
@@ -53,7 +53,11 @@ from jla.ops.mosaic_gpu.vector_gate import (
     _masked_exp,
     _matmul,
     _per_block,
+    _put,
     _rows,
+    _rows_of,
+    _state_rows,
+    _tc05,
     _slab_smem,
     _split_bf16,
     _swizzled,
@@ -165,6 +169,7 @@ def bwd_state(
         else:
             b, piece, first, count, skip, last_piece = bp, 0, 0, nc, 0, 1
         vcols = pl.ds(vt * bv, bv)
+        row_blocks = _state_rows(cfg)  # one block (Hopper), 64-row blocks (Blackwell)
 
         def chunk(i):  # the chunk of the walk's step i
             return first + count - 1 - i if split else nc - 1 - i
@@ -193,9 +198,13 @@ def bwd_state(
             plgpu.copy_gmem_to_smem(df_ref.at[b, h, :, vcols], f_smem, f_bar)
             fetch(0, 0)
             plgpu.barrier_wait(f_bar)
-            ds0 = _load(f_smem)
-            if split:  # a piece other than the last starts in the next piece's first chunk: no gradient enters
-                ds0 = ds0 * last_piece.astype(_F32)
+            ds0 = []
+            for rows in row_blocks:
+                ds_blk = _load(f_smem) if rows is None else _load(f_smem.at[rows])
+                if split:  # a piece other than the last starts in the next piece's first chunk: no gradient enters
+                    ds_blk = ds_blk * last_piece.astype(_F32)
+                ds0.append(ds_blk)
+            ds0 = tuple(ds0)
 
             def step(i, ds):
                 n = chunk(i)
@@ -208,7 +217,11 @@ def bwd_state(
 
                 plgpu.barrier_wait(bars.at[slot])
                 plgpu.wait_smem_to_gmem(0, wait_read_only=True)
-                ds_smem[...] = ds.astype(_BF16)
+                for rows, ds_blk in zip(row_blocks, ds):
+                    if rows is None:
+                        ds_smem[...] = ds_blk.astype(_BF16)
+                    else:
+                        ds_smem.at[rows][...] = ds_blk.astype(_BF16)
                 plgpu.commit_smem()
                 stored(i, skip, lambda: plgpu.copy_smem_to_gmem(ds_smem, dh_ref.at[b, h, n, :, vcols],
                                                                 commit_group=False))
@@ -226,15 +239,26 @@ def bwd_state(
                     plgpu.commit_smem_to_gmem_group()
 
                 stored(i, skip, store_dv_new)
-                decayed = ds * _rows(jnp.exp(_load(gl_smem.at[slot], _ROW)), (kd, bv))
-                pairs = ((qg_smem.at[slot].T, do_smem.at[slot]), (w_smem.at[slot].T, neg_smem))
-                return _matmul(cfg, (kd, bv), *pairs, init=decayed)
+                ds_new = []
+                for rows, ds_blk in zip(row_blocks, ds):
+                    if rows is None:
+                        decayed = ds_blk * _rows(jnp.exp(_load(gl_smem.at[slot], _ROW)), ds_blk.shape)
+                        pairs = ((qg_smem.at[slot].T, do_smem.at[slot]), (w_smem.at[slot].T, neg_smem))
+                    else:
+                        decayed = ds_blk * _rows(jnp.exp(_load(gl_smem.at[slot, rows], _ROW)), ds_blk.shape)
+                        pairs = ((qg_smem.at[slot, :, rows].T, do_smem.at[slot]), (w_smem.at[slot, :, rows].T, neg_smem))
+                    ds_new.append(_matmul(cfg, ds_blk.shape, *pairs, init=decayed))
+                return tuple(ds_new)
 
             ds = lax.fori_loop(0, count, step, ds0)
             plgpu.wait_smem_to_gmem(0, wait_read_only=True)
 
             def store_dh0():
-                f_smem[...] = ds
+                for rows, ds_blk in zip(row_blocks, ds):
+                    if rows is None:
+                        f_smem[...] = ds_blk
+                    else:
+                        f_smem.at[rows][...] = ds_blk
                 plgpu.commit_smem()
                 plgpu.copy_smem_to_gmem(f_smem, dh0_ref.at[b, h, :, vcols])
 
@@ -369,7 +393,7 @@ def bwd_wy(
         decay = jnp.exp(g)
         last = _load(last_smem, _COL)
         to_end = jnp.exp(_cols(last, kshape) - g)
-        dq_ref.at[b, tok, hh, kcols][...] = dqs * decay * cfg.scale
+        _put(dq_ref.at[b, tok, hh, kcols], dqs * decay * cfg.scale)
         ready(2)
         dg = _load(qg_smem).astype(_F32) * dqs
         # State update S_{n+1} = exp(G_last) S_n + kg^T v_new with kg = k exp(G_last - G).
@@ -379,9 +403,17 @@ def bwd_wy(
         kgv = kf * to_end
         dk = dkg * to_end
         dg = dg - kgv * dkg
-        state_term = _matmul(cfg, (kp, kp), (h_smem, dh_smem.T))  # diagonal: sum_v S dS per channel
-        diag = jnp.where(_iota((kp, kp), 0) == _iota((kp, kp), 1), state_term, 0.0)
-        d_last = jnp.exp(last) * jnp.sum(diag, axis=0) + jnp.sum(kgv * dkg, axis=0)
+        if _tc05(cfg) and kp > c:  # Blackwell: 64-row products; only their diagonal entries are kept
+            diag_sum = None
+            for r0 in range(0, kp, c):
+                part = _matmul(cfg, (c, kp), (h_smem.at[pl.ds(r0, c)], dh_smem.T))
+                part = jnp.sum(jnp.where(_iota((c, kp), 0) + r0 == _iota((c, kp), 1), part, 0.0), axis=0)
+                diag_sum = part if diag_sum is None else diag_sum + part
+            d_last = jnp.exp(last) * diag_sum + jnp.sum(kgv * dkg, axis=0)
+        else:
+            state_term = _matmul(cfg, (kp, kp), (h_smem, dh_smem.T))  # diagonal: sum_v S dS per channel
+            diag = jnp.where(_iota((kp, kp), 0) == _iota((kp, kp), 1), state_term, 0.0)
+            d_last = jnp.exp(last) * jnp.sum(diag, axis=0) + jnp.sum(kgv * dkg, axis=0)
         dg = jnp.where(rows_k == c - 1, dg + _cols(d_last, kshape), dg)
         # v_new = u - w S_n, w = T kb with kb = erase exp(G) k.
         ready(4)
@@ -393,11 +425,11 @@ def bwd_wy(
         plgpu.commit_smem()
         ready(5)
         dkb = _matmul(cfg, kshape, (t_smem.T, dw_smem))
-        dk_ref.at[b, tok, hh, kcols][...] = dk + dkb * erase_v * decay
-        dg_ref.at[b, tok, hh, kcols][...] = dg + dkb * kb
+        _put(dk_ref.at[b, tok, hh, kcols], dk + dkb * erase_v * decay)
+        _put(dg_ref.at[b, tok, hh, kcols], dg + dkb * kb)
         gate_k = dkb * kf * decay  # gradient of the erase gate
         if cfg.channel_gates:
-            outs[5].at[b, tok, hh, kcols][...] = gate_k
+            _put(outs[5].at[b, tok, hh, kcols], gate_k)
         dt = _matmul(cfg, (c, c), (dw_smem, kb_smem.T))
 
         # Value side (columns vcols): u = T vb with vb = write v.
@@ -409,13 +441,13 @@ def bwd_wy(
         plgpu.commit_smem()
         dvn_cols = dvn_smem.at[:, vcols]
         dvb = _matmul(cfg, vshape, (t_smem.T, dvn_cols))
-        dv_ref.at[b, tok, hh, vcols][...] = (dvb * write_v).astype(dv_ref.dtype)
+        _put(dv_ref.at[b, tok, hh, vcols], (dvb * write_v).astype(dv_ref.dtype))
         if cfg.channel_gates:
-            outs[6].at[b, tok, hh, vcols][...] = (dvb * vf).astype(outs[6].dtype)
+            _put(outs[6].at[b, tok, hh, vcols], (dvb * vf).astype(outs[6].dtype))
         else:
             dbeta = jnp.sum(gate_k, axis=1) + jnp.sum(dvb * vf, axis=1)
-            outs[5].at[b, tok, hh, p][...] = dbeta
-        dt_ref.at[b, hh, p, tok][...] = dt + _matmul(cfg, (c, c), (dvn_cols, vb_smem.T))
+            _put(outs[5].at[b, tok, hh, p], dbeta)
+        _put(dt_ref.at[b, hh, p, tok], dt + _matmul(cfg, (c, c), (dvn_cols, vb_smem.T)))
 
     if cfg.channel_gates:
         gate_scratch = (_swizzled((c, kp), erase.dtype), _swizzled((c, vp), write.dtype))
@@ -472,7 +504,7 @@ def bwd_dakk(cfg: Config, t: Array, dt: Array) -> Array:
         plgpu.commit_smem()
         da = _matmul(cfg, full, (t_smem.T, hi_smem), (t_smem.T, lo_smem))  # T^T dT T^T
         strict = _iota(full, 1) < _iota(full, 0)
-        da_smem[...] = jnp.where(strict, -da, 0.0)
+        _put(da_smem, jnp.where(strict, -da, 0.0))
         plgpu.commit_smem()
         plgpu.copy_smem_to_gmem(da_smem, da_ref.at[b, h, tok])
         plgpu.wait_smem_to_gmem(0)
@@ -516,6 +548,8 @@ def _matmuls(cfg: Config, shape: tuple[int, int], pairs: list) -> list[Array]:
     """
     if _REFERENCE_SCHEDULE:
         return [_matmul(cfg, shape, pair) for pair in pairs]
+    if _tc05(cfg):  # Blackwell: one TMEM accumulator per product, one commit for all
+        return list(products(*((a, b, shape) for a, b in pairs)))
 
     def scoped(*accs):
         for acc, (a, b) in zip(accs, pairs):
@@ -588,11 +622,14 @@ def bwd_intra(
         wg = lax.axis_index("wg")
         tok = pl.ds(n * c, c)
 
-        def per_warpgroup(fn, *per_wg):
-            """``fn(w, *values)`` on warpgroup ``w``, ``values`` picked from ``per_wg`` (one pair each)."""
-            if _REFERENCE_SCHEDULE:
+        def per_warpgroup(fn, *per_wg, products_in=False):
+            """``fn(w, *values)`` on warpgroup ``w``, ``values`` picked from ``per_wg`` (one pair each).
+
+            Blackwell, with tensor-core products in ``fn``: one branch per warpgroup (``tc_group``), so
+            each warpgroup's products get their own TMEM accumulators and barriers."""
+            if _REFERENCE_SCHEDULE or (products_in and _tc05(cfg)):
                 for w in range(2):
-                    pl.when(wg == w)(functools.partial(fn, w, *(pair[w] for pair in per_wg)))
+                    pl.when(wg == w)(tc_group(w)(functools.partial(fn, w, *(pair[w] for pair in per_wg))))
             else:
                 fn(wg, *(jnp.where(wg == 0, pair[0], pair[1]) for pair in per_wg))
 
@@ -627,10 +664,10 @@ def bwd_intra(
             # coef[w, 0, d, i] = M[i, i - d] and coef[w, 1, d, j] = M[j + d, j] = coef[w, 0, d, j + d]
             # (entries past the chunk are never used).
             for d in range(_HALF):
-                coef_smem.at[w, 0, d, pl.ds(0, c)][...] = jnp.sum(jnp.where(fcol == frow - d, m, 0.0), axis=1)
+                _put(coef_smem.at[w, 0, d, pl.ds(0, c)], jnp.sum(jnp.where(fcol == frow - d, m, 0.0), axis=1))
             plgpu.commit_smem()
             for d in range(_HALF):
-                coef_smem.at[w, 1, d, pl.ds(0, c)][...] = _load(coef_smem.at[w, 0, d, pl.ds(d, c)], _ROW)
+                _put(coef_smem.at[w, 1, d, pl.ds(0, c)], _load(coef_smem.at[w, 0, d, pl.ds(d, c)], _ROW))
 
         # Upstream matrix w on warpgroup w: scale dAqk, dAkk (a traced scale multiplies by the same f32).
         per_warpgroup(stage, (cfg.scale, 1.0))
@@ -665,7 +702,7 @@ def bwd_intra(
                 for cb in range(_NUM_SUB - 1):
                     y_w.at[cb][...] = (a * past[cb]).astype(_BF16)
                 y_w.at[_NUM_SUB - 1][...] = jnp.where(second, a * half, 0.0).astype(_BF16)
-                apad_w.at[pl.ds(0, c), data][...] = a.astype(_BF16)
+                _put(apad_w.at[pl.ds(0, c), data], a.astype(_BF16))
                 plgpu.commit_smem()
                 m_w, mq_w = m_bf.at[mat], mq_bf.at[mat]
                 blk = [pl.ds(SUB_CHUNK * cb, SUB_CHUNK) for cb in range(_NUM_SUB - 1)]
@@ -727,34 +764,34 @@ def bwd_intra(
                 # the middle of their block, and the per-token decays e^{g_t} = e^{G_t - G_{t-1}}.
                 x_w[...] = (kf * to_end).astype(_BF16)
                 x2_w[...] = jnp.where(second, 0.0, kf * half).astype(_BF16)
-                kpad_w.at[pl.ds(_SHIFT, c), data][...] = kf.astype(_BF16)
-                epad_w.at[pl.ds(_SHIFT, c), data][...] = g
+                _put(kpad_w.at[pl.ds(_SHIFT, c), data], kf.astype(_BF16))
+                _put(epad_w.at[pl.ds(_SHIFT, c), data], g)
                 g_prev = _load(epad_w.at[pl.ds(_SHIFT - 1, c), data])
-                epad_w.at[pl.ds(_SHIFT, c), data][...] = jnp.exp(g - g_prev)
+                _put(epad_w.at[pl.ds(_SHIFT, c), data], jnp.exp(g - g_prev))
 
                 qf = _bf16_values(_load(q_smem.at[:, cols]))
                 da_q, db_q = matrix_pass(0, qf, kf, to_end, past, half)
-                dq_ref.at[b, tok, h, cols][...] = (_load(dqp_ref.at[b, tok, h, cols]) + da_q).astype(dq_ref.dtype)
+                _put(dq_ref.at[b, tok, h, cols], (_load(dqp_ref.at[b, tok, h, cols]) + da_q).astype(dq_ref.dtype))
                 dg = qf * da_q - kf * db_q
                 kr = _bf16_values(kf * erase_v)
                 plgpu.commit_smem()  # the first pass's operand buffers may be overwritten
                 da_k, db_k = matrix_pass(1, kr, kf, to_end, past, half)
                 dk = _load(dkp_ref.at[b, tok, h, cols]) + db_q + erase_v * da_k + db_k
-                dk_ref.at[b, tok, h, cols][...] = dk.astype(dk_ref.dtype)
-                dg_ref.at[b, tok, h, cols][...] = _load(dgp_ref.at[b, tok, h, cols]) + dg + kr * da_k - kf * db_k
+                _put(dk_ref.at[b, tok, h, cols], dk.astype(dk_ref.dtype))
+                _put(dg_ref.at[b, tok, h, cols], _load(dgp_ref.at[b, tok, h, cols]) + dg + kr * da_k - kf * db_k)
                 if cfg.channel_gates:
                     d_erase = _load(gp_ref.at[b, tok, h, cols]) + kf * da_k
-                    gate_ref.at[b, tok, h, cols][...] = d_erase.astype(gate_ref.dtype)
+                    _put(gate_ref.at[b, tok, h, cols], d_erase.astype(gate_ref.dtype))
                     return dbeta
                 return dbeta + jnp.sum(kf * da_k, axis=1)
 
             init = plgpu.layout_cast(jnp.zeros((c,), _F32), _ROW)
             dbeta = lax.fori_loop(first_slab, first_slab + half_count, slab_step, init)
             if not cfg.channel_gates:
-                dbeta_smem.at[w][...] = dbeta
+                _put(dbeta_smem.at[w], dbeta)
 
         # Warpgroup w takes the key slabs [w count/2, (w + 1) count/2).
-        per_warpgroup(run_slabs, (0, half_count))
+        per_warpgroup(run_slabs, (0, half_count), products_in=True)
 
         if not cfg.channel_gates:
             plgpu.barrier_arrive(sync)
@@ -765,7 +802,7 @@ def bwd_intra(
                 total = _load(dbeta_smem.at[0], _ROW) + _load(dbeta_smem.at[1], _ROW)
                 for p in range(_parts(cfg)):
                     total = total + _load(gp_ref.at[b, tok, h, p], _ROW)
-                gate_ref.at[b, tok, h][...] = total
+                _put(gate_ref.at[b, tok, h], total)
 
         finish_together(finish)  # no warpgroup exits while the other may still issue wgmmas
 

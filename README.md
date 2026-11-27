@@ -1,6 +1,6 @@
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/jla-org/jax-linear-attention/main/docs/assets/banner-dark.png">
-  <img alt="jax-linear-attention: fast linear attention, SSM and attention kernels for JAX on NVIDIA Hopper. 72.3% MFU on one H100 (1.3B transformer, FP8), 68.2% MFU per GPU on 8 H100s, kernels up to 5.37x faster (Mamba-3 MIMO against the official recurrence kernels), 1.04-1.67x flame end to end in bf16" src="https://raw.githubusercontent.com/jla-org/jax-linear-attention/main/docs/assets/banner-light.png">
+  <img alt="jax-linear-attention: fast linear attention, SSM and attention kernels for JAX on NVIDIA Hopper and Blackwell. 72.3% MFU on one H100 (1.3B transformer, FP8), 68.2% MFU per GPU on 8 H100s, kernels up to 5.37x faster (Mamba-3 MIMO against the official recurrence kernels), 1.04-1.67x flame end to end in bf16" src="https://raw.githubusercontent.com/jla-org/jax-linear-attention/main/docs/assets/banner-light.png">
 </picture>
 
 [![CI](https://github.com/jla-org/jax-linear-attention/actions/workflows/ci.yml/badge.svg)](https://github.com/jla-org/jax-linear-attention/actions/workflows/ci.yml)
@@ -8,11 +8,11 @@
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-3776AB.svg)](#install)
 [![JAX 0.11.2](https://img.shields.io/badge/JAX-0.11.2-8A2BE2.svg)](#install)
-[![NVIDIA Hopper](https://img.shields.io/badge/NVIDIA-Hopper-76B900.svg)](#install)
+[![NVIDIA Hopper | Blackwell](https://img.shields.io/badge/NVIDIA-Hopper%20%7C%20Blackwell-76B900.svg)](#install)
 [![Chat on Discord](https://img.shields.io/badge/chat-Discord-3D5AFE?logo=discord&logoColor=white)](https://discord.com/invite/rWuU7cWU4E)
 
 **jax-linear-attention** brings FLA-class linear-attention kernels to JAX: Pallas Mosaic
-GPU kernels for NVIDIA Hopper, forward and backward, for Mamba-2, Mamba-3, Gated DeltaNet, KDA, RWKV-7,
+GPU kernels for NVIDIA Hopper and (opt-in, new in 0.2.0) datacenter Blackwell, forward and backward, for Mamba-2, Mamba-3, Gated DeltaNet, KDA, RWKV-7,
 GLA and more, with an FA3-style attention kernel and a full LLM training stack around them. It is built
 for researchers and engineers who train linear-attention, state-space and hybrid models in JAX. Every
 kernel is exact by default and measured against the latest upstream code, and this page shows where we
@@ -20,7 +20,7 @@ lose as plainly as where we win.
 
 <p align="center">
   <a href="#quick-start">Quick start</a> · <a href="#supported-architectures">Architectures</a> ·
-  <a href="#benchmarks">Benchmarks</a> · <a href="#where-we-lose">Where we lose</a> ·
+  <a href="#benchmarks">Benchmarks</a> · <a href="#blackwell-experimental">Blackwell</a> · <a href="#where-we-lose">Where we lose</a> ·
   <a href="#faq">FAQ</a> · <a href="docs/">Docs</a> · <a href="https://discord.com/invite/rWuU7cWU4E">Discord</a>
 </p>
 
@@ -51,6 +51,9 @@ backward, the other implementation's time over ours.
   [Gated DeltaNet](benchmarks/gdn.md)).
 - **Exact, packed and long**: fp32 states and accumulation, exact packed-document masks in every kernel,
   and single calls of 1,064,960 tokens that match chained halves ([long contexts](benchmarks/long_context.md)).
+- **New in 0.2.0, Blackwell (opt-in)**: the Gated DeltaNet and KDA kernels run on B200 and B300 (tcgen05
+  tensor cores, `JLA_BLACKWELL=1`): Gated DeltaNet 1.54-2.00x FLA's Triton kernels and KDA 1.43-1.53x FLA
+  forward + backward on the same GPU ([Blackwell](#blackwell-experimental)).
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/jla-org/jax-linear-attention/main/docs/assets/kernels-dark.png">
@@ -78,12 +81,14 @@ The layers behind newer language models (Mamba, Gated DeltaNet, KDA, RWKV-7, GLA
 they need dedicated kernels to train fast. PyTorch has them in Flash Linear Attention's Triton kernels.
 In JAX these layers have mostly run as plain JAX ops (MaxText's Gated DeltaNet, for example), which XLA
 cannot fuse into one efficient pass. jax-linear-attention brings kernels of FLA's class to JAX on
-NVIDIA Hopper, with the training stack to use them, and keeps every kernel exact, so switching the
+NVIDIA Hopper (and, opt-in, Blackwell), with the training stack to use them, and keeps every kernel exact, so switching the
 implementation never changes the model.
 
 ## Supported architectures
 
-Kernels are Pallas Mosaic GPU kernels for H100 (sm_90a), picked by `impl="auto"` unless marked opt-in.
+Kernels are Pallas Mosaic GPU kernels for H100/H200 (sm_90a), picked by `impl="auto"` unless marked opt-in.
+Gated DeltaNet, DeltaNet, simple GLA (Mamba-2 style) and KDA also run on datacenter Blackwell (B200, B300)
+with `JLA_BLACKWELL=1` ([Blackwell](#blackwell-experimental)).
 Speed is forward + backward against the strongest latest upstream code (the other implementation's time
 over ours); "-" means no upstream comparison, and "provisional" marks a cell measured while other jobs could
 share the machine.
@@ -123,7 +128,8 @@ and the ports: [docs/architectures.md](docs/architectures.md) and [docs/kernels.
 ## Install
 
 Requirements: Python 3.12 or newer and JAX 0.11.2 (the version is pinned). The Mosaic GPU
-kernels need an NVIDIA Hopper GPU (H100/H200, sm_90a) and a driver for CUDA 13. On any other device
+kernels need an NVIDIA Hopper GPU (H100/H200, sm_90a) and a driver for CUDA 13; the Gated DeltaNet, DeltaNet,
+simple GLA and KDA kernels also run on B200/B300 (sm_100/sm_103) with `JLA_BLACKWELL=1`. On any other device
 every op falls back to its plain-JAX implementation.
 
 ```bash
@@ -156,7 +162,7 @@ Optional extras:
 ## Quick start
 
 The Python package and the command-line tool are `jla`. Call a kernel; `impl="auto"` runs the Mosaic
-GPU kernel on an H100 and the chunked JAX op anywhere else:
+GPU kernel on an H100 (or a B200/B300 with `JLA_BLACKWELL=1`) and the chunked JAX op anywhere else:
 
 ```python
 import jax
@@ -239,7 +245,7 @@ Every option, default and measurement: [docs/training.md](docs/training.md).
 ## How it works
 
 - **Three implementations of every recurrence**: a token-by-token reference (the oracle), a
-  chunk-parallel JAX op that runs on any JAX backend, and a Pallas Mosaic GPU kernel for Hopper. The
+  chunk-parallel JAX op that runs on any JAX backend, and a Pallas Mosaic GPU kernel for Hopper (several also for Blackwell). The
   tests hold each kernel to the reference on dense inputs, packed documents, initial and final states
   and every gradient.
 - **Fail-closed dispatch**: `impl="auto"` runs a kernel only for the shapes, dtypes and options its GPU
@@ -255,12 +261,12 @@ Every option, default and measurement: [docs/training.md](docs/training.md).
 | | Plain JAX ops | FLA on PyTorch | jax-linear-attention |
 |---|---|---|---|
 | Framework | JAX | PyTorch | JAX |
-| Linear-attention GPU kernels | none (XLA ops) | Triton, plus TileLang, FlashQLA and FlashKDA backends | Pallas Mosaic GPU for H100, forward and backward |
+| Linear-attention GPU kernels | none (XLA ops) | Triton, plus TileLang, FlashQLA and FlashKDA backends | Pallas Mosaic GPU for H100, plus B200/B300 for the delta-rule kernels (opt-in), forward and backward |
 | Speed on one H100 | the baseline | the strongest PyTorch option | the Mamba-2 scan 1.20-1.96x and Mamba-3 MIMO 2.70-5.37x the official recurrence kernels, KDA 1.47-1.78x FLA, RWKV-7 1.06-1.46x FLA, Gated DeltaNet 1.71-2.68x FLA Triton; slower than FlashQLA and FA3 in [some cases](#where-we-lose) |
 | Results | exact | exact, with approximate options in some backends (FlashQLA's sequence split) | exact by default |
 | Training stack | bring your own | flame (torchtitan) | built in: FSDP, TP, EP, PP, FP8, MoE, SFT, DPO, Hugging Face conversion |
 | 1.3B training on one H100 | | flame | 1.04-1.67x flame in bf16, 1.10-1.77x in FP8 |
-| Hardware for the kernels | any JAX backend | GPUs Triton supports | NVIDIA Hopper (H100, H200); plain JAX elsewhere |
+| Hardware for the kernels | any JAX backend | GPUs Triton supports | NVIDIA Hopper (H100, H200); Blackwell (B200, B300) opt-in for Gated DeltaNet, DeltaNet, simple GLA and KDA; plain JAX elsewhere |
 
 ## Benchmarks
 
@@ -328,6 +334,43 @@ claim no bf16 comparison. (d) Measured the same day on the code just before the 
 release, which leave `gdn-1p3b`'s `K = 256` kernels as they were (on one GPU those changes moved the other presets
 by 0.98-1.03x). All footnotes, GDN-2 and the 8-GPU protocol: [docs/results.md](docs/results.md#one-h100).
 
+## Blackwell (experimental)
+
+New in 0.2.0: the Gated DeltaNet, DeltaNet, simple GLA (Mamba-2 style) and KDA kernels also run on datacenter
+Blackwell, B200 (sm_100) and B300 (sm_103), on its tcgen05 tensor cores with accumulators in tensor memory.
+They are opt-in while they mature:
+
+```bash
+JLA_BLACKWELL=1 python train.py ...   # without it, Blackwell GPUs run the plain-JAX ops
+```
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/jla-org/jax-linear-attention/main/docs/assets/blackwell-dark.png">
+  <img alt="Blackwell kernels, forward + backward against FLA's Triton kernels on the same GPU: Gated DeltaNet 1.54-1.98x on B200 and 1.54-2.00x on B300, KDA 1.43-1.53x on B200; the Hopper kernels on an H200 1.84-2.05x" src="https://raw.githubusercontent.com/jla-org/jax-linear-attention/main/docs/assets/blackwell-light.png">
+</picture>
+
+| bf16, forward + backward, ms | B200 | B300 | H200 (Hopper kernels) |
+|---|---|---|---|
+| Gated DeltaNet (8, 4096, 16, 128, 128) | 1.675 | 1.602 | 1.552 |
+| Gated DeltaNet (2, 16384, 16, 128, 128) | 2.193 | 2.104 | 2.106 |
+| Gated DeltaNet (8, 4096, 32, 64, 64) | 1.878 | 1.814 | 1.565 |
+
+Shapes are (B, T, H, K, V); times are median kernel time per call, measured on 27 Nov 2026 on one GPU
+each. Against FLA's Triton kernels on the same GPU, forward + backward: Gated DeltaNet 1.55-1.98x on B200
+and 1.54-2.00x on B300; KDA 1.43-1.53x on B200 over four shapes (forward alone 0.99-1.13x).
+
+What is tested: the Gated DeltaNet, DeltaNet, simple GLA and KDA test files pass on B200 with the released
+kernels; on B300 the Gated DeltaNet files passed on the kernels before the last tuning step, and the tuned
+kernels were benchmarked there. Gated DeltaNet also passes on JAX 0.12.1. Known limits on Blackwell:
+
+- 64-row tiles only: the opt-in fused Gated DeltaNet backward (`fused_bwd`) needs 128-row tiles and stops
+  with a clear error; the default backward runs.
+- Slower than it could be: B200 trails the same kernels on an H200 by 4-20% (synchronous tensor-core
+  products where Hopper overlaps them; 128-row products would remove most of it).
+- Gated DeltaNet-2's opt-in fused solve at head dim 128 needs 1.1 KB more shared memory than Blackwell has
+  (a compile error, not a wrong result); KDA's reference backward schedule matches the default to the
+  tolerance but not bit for bit.
+
 ## Where we lose
 
 - **Softmax attention against FA3**: the forward is 0.90-0.92x FA3 on causal attention, short of the
@@ -341,7 +384,10 @@ by 0.98-1.03x). All footnotes, GDN-2 and the 8-GPU protocol: [docs/results.md](d
   packed documents in short rows also trail FLA (0.83-0.93x forward + backward at 2K-8K tokens).
 - **KDA inference against FlashKDA** at large `B * H` (0.57x at `(8, 2048, 32)`; FlashKDA keeps a bf16
   state and approximate `exp`, and fuses its per-chunk preparation into one kernel).
-- **Hopper only, one JAX version**: the kernels need an H100/H200 (everything else runs plain JAX), and
+- **Blackwell is new and untuned**: on B200 the Gated DeltaNet kernels are 4-20% slower than the same
+  kernels on an H200 (64-row tiles and synchronous tensor-core products; the Hopper kernels overlap them),
+  and only Gated DeltaNet, DeltaNet, simple GLA and KDA run there yet ([Blackwell](#blackwell-experimental)).
+- **One JAX version**: the kernels need an H100/H200 or (opt-in) a B200/B300; everything else runs plain JAX, and
   JAX is pinned to 0.11.2 because Mosaic GPU's API changes with every JAX release. A few kernels (the
   Mamba-2 row kernels, the Gated DeltaNet piece scan, `fp8_swiglu`) are Pallas Triton, which JAX 0.11.2
   deprecates; they move to Mosaic GPU before the pin does.
@@ -350,7 +396,7 @@ Every case with its numbers and the reason: [docs/kernels.md](docs/kernels.md#wh
 
 ## Status and limitations
 
-- Early development (0.1.0): the APIs will change.
+- Early development (0.2.0): the APIs will change.
 - The release numbers were measured on 20 Oct 2026 with no other jobs on the GPUs. Numbers marked provisional were
   measured while other jobs could share the machine.
 - Context parallelism is a library API; the trainer has no `cp` mesh axis yet.
@@ -366,7 +412,7 @@ Every case with its numbers and the reason: [docs/kernels.md](docs/kernels.md#wh
 
 **Does it run without an H100?** Yes. Every op has a chunked JAX implementation that runs on any JAX
 backend, and `impl="auto"` uses it wherever the Mosaic GPU kernels don't apply. The tests run on CPU and
-H100; the kernel speedups need Hopper (H100 or H200).
+H100; the kernel speedups need Hopper (H100 or H200), or B200/B300 for the opt-in Blackwell kernels.
 
 **Why is JAX pinned to 0.11.2?** Mosaic GPU's Python API changes between JAX releases, and every kernel
 is tested against one version. Moving to a newer JAX means testing every kernel again, so it comes with a

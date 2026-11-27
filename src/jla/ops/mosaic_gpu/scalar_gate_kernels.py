@@ -51,8 +51,7 @@ from jla.ops.mosaic_gpu._common import (
     matmul,
     same_run,
     smem,
-    stage as _stage,
-)
+    stage as _stage, mma, mma_acc)
 
 Array = jax.Array
 F32 = jnp.float32
@@ -436,11 +435,11 @@ def state_bwd(
                 plgpu.commit_smem_to_gmem_group()
 
             def update(acc):
-                plgpu.wgmma(acc, do_t, q_smem.at[slot])
+                mma(acc, do_t, q_smem.at[slot])
                 if delta:
-                    plgpu.wgmma(acc, dvn_lo, w_smem.at[slot])
+                    mma(acc, dvn_lo, w_smem.at[slot])
 
-            return pl.run_state(update)(plgpu.ACC.init(ds_t * s_decay))
+            return mma_acc(update, ds_t * s_decay)
 
         ds_t = lax.fori_loop(0, ncs, step, ds0)
         if want_dh0:

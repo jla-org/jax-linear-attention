@@ -22,7 +22,7 @@ from _vector_gate import assert_close, config, from_heads, inputs, kernel_gates,
 from jla.ops.mosaic_gpu import vector_gate as vg
 from jla.ops.mosaic_gpu import vector_gate_ops as vgo
 
-pytestmark = pytest.mark.skipif(not vgo.is_hopper(), reason="needs an H100 (compute capability 9.0)")
+pytestmark = pytest.mark.skipif(not (vgo.is_hopper() or vgo.blackwell_enabled()), reason="needs an H100 (compute capability 9.0), or a Blackwell GPU with JLA_BLACKWELL=1")
 
 
 def _equal(got, want, name):

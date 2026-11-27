@@ -21,7 +21,7 @@ from jla.ops.mosaic_gpu import vector_gate as vg
 from jla.ops.reference import segment_resets
 from jla.ops.mosaic_gpu import vector_gate_ops as vgo
 
-gpu = pytest.mark.skipif(not vgo.is_hopper(), reason="needs an H100 (compute capability 9.0)")
+gpu = pytest.mark.skipif(not (vgo.is_hopper() or vgo.blackwell_enabled()), reason="needs an H100 (compute capability 9.0), or a Blackwell GPU with JLA_BLACKWELL=1")
 
 
 def _layout(name: str, B: int, T: int) -> jax.Array:

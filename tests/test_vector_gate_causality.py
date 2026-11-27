@@ -22,7 +22,7 @@ from jla.ops import reference as ref
 from jla.ops.mosaic_gpu import vector_gate_ops as vgo
 
 F32, BF16 = jnp.float32, jnp.bfloat16
-gpu = pytest.mark.skipif(not vgo.is_hopper(), reason="needs an H100 (compute capability 9.0)")
+gpu = pytest.mark.skipif(not (vgo.is_hopper() or vgo.blackwell_enabled()), reason="needs an H100 (compute capability 9.0), or a Blackwell GPU with JLA_BLACKWELL=1")
 
 
 def _inputs(kind: str, T: int = 200, H: int = 2, K: int = 128):

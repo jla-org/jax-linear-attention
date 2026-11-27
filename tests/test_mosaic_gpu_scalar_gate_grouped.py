@@ -26,7 +26,7 @@ from jla.ops.mosaic_gpu import scalar_gate as sg
 from jla.ops.mosaic_gpu import scalar_gate_grouped as sgg
 from jla.ops.mosaic_gpu import scalar_gate_kernels as sk
 
-gpu = pytest.mark.skipif(not cm.is_hopper(), reason="needs an H100 (compute capability 9.0)")
+gpu = pytest.mark.skipif(not (cm.is_hopper() or cm.blackwell_enabled()), reason="needs an H100 (compute capability 9.0), or a Blackwell GPU with JLA_BLACKWELL=1")
 
 F32, BF16 = jnp.float32, jnp.bfloat16
 C = cm.CHUNK

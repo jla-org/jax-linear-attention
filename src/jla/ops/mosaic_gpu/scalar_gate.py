@@ -88,8 +88,7 @@ from jla.ops.mosaic_gpu._common import (
     is_hopper,
     num_sms,
     pad_time,
-    segment_vectors,
-)
+    segment_vectors, blackwell_enabled, is_blackwell)
 from jla.ops.mosaic_gpu._common import MAX_GRID_YZ
 
 Array = jax.Array
@@ -98,6 +97,7 @@ HIGHEST = lax.Precision.HIGHEST
 # Sequence split policy, measured on an H100 (benchmarks/README.md): splitting pays only when the serial
 # passes would run at most MAX_SPLIT_CTAS CTAs; each piece walks at least MIN_PIECE_CHUNKS chunks.
 MAX_SPLIT_CTAS = 32
+MAX_SPLIT_CTAS_BLACKWELL = 64  # B200 (148 SMs): 64-CTA calls run faster in 2 pieces (measured, profile_gdn_stages)
 MIN_PIECE_CHUNKS = 8
 # The delta rule also pays for the piece maps M (an extra state pass) and their scan: at most MAX_DELTA_PIECES
 # pieces, and more than 4 only when every piece keeps at least DELTA_PIECE_CHUNKS_ABOVE_4 chunks (measured on an
@@ -136,7 +136,8 @@ def pieces(batch: int, heads: int, value_dim: int, seq_len: int, *, delta: bool)
     each at least ``MIN_PIECE_CHUNKS`` chunks long.
     """
     ctas = batch * heads * (value_dim // 64)
-    if ctas > MAX_SPLIT_CTAS:
+    wide = is_blackwell() and num_sms() >= 148  # measured on B200; other GPUs keep the Hopper-tuned limit
+    if ctas > (MAX_SPLIT_CTAS_BLACKWELL if wide else MAX_SPLIT_CTAS):
         return 1
     chunks = -(-seq_len // CHUNK)
     limit = min(MAX_DELTA_PIECES, num_sms() // ctas) if delta else num_sms() // ctas
@@ -479,8 +480,8 @@ def unsupported_reason(q, k, v, gates: tuple, options: dict, *, delta: bool) -> 
     extra = sorted(set(options) - allowed)
     if extra:
         return f"unsupported options {extra}"
-    if not is_hopper():
-        return "the Mosaic GPU kernels need an sm_90 (Hopper) GPU"
+    if not (is_hopper() or blackwell_enabled()):
+        return "the Mosaic GPU kernels need an sm_90 (Hopper) GPU, or a Blackwell GPU with JLA_BLACKWELL=1"
     if options.get("cu_seqlens") is not None:
         return "cu_seqlens is not supported; pass segment_ids or use the reference"
     if options.get("chunk_size", CHUNK) != CHUNK:

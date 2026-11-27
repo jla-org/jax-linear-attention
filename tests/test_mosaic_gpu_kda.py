@@ -46,7 +46,7 @@ from jla.ops.mosaic_gpu import vector_gate as vg
 from jla.ops.mosaic_gpu import vector_gate_bwd as vgb
 from jla.ops.mosaic_gpu import vector_gate_ops as vgo
 
-ON_HOPPER = vgo.is_hopper()
+ON_HOPPER = vgo.is_hopper() or vgo.blackwell_enabled()  # Blackwell: JLA_BLACKWELL=1
 gpu = pytest.mark.skipif(not ON_HOPPER, reason="needs an H100 (compute capability 9.0)")
 # The interpreter runs every kernel op through host callbacks: on the CPU backend only (slow on a GPU).
 cpu_only = pytest.mark.skipif(jax.default_backend() != "cpu", reason="interpreter tests run on the CPU backend")

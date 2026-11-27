@@ -54,8 +54,7 @@ from jla.ops.mosaic_gpu._common import (
     matmul,
     num_sms,
     same_run,
-    smem,
-)
+    smem, mma, mma_acc)
 
 Array = jax.Array
 F32 = jnp.float32
@@ -609,6 +608,7 @@ def wy_bwd(
         db = db + (daf * s).sum(axis=1)
         ada = s * bcast_rows(b_row, sq) * daf
         col_smem[...] = ada.sum(axis=0)
+        plgpu.commit_smem()  # the ROWS load reads lanes other threads stored (warpgroup barrier)
         dg = dg + ada.sum(axis=1) - plgpu.load(col_smem, layout=ROWS)
         das = (daf * bcast_rows(b_row, sq)).astype(dtype)
         da_smem[...] = das
@@ -616,10 +616,10 @@ def wy_bwd(
 
         for i in range(key_dim // HALF):
             def sym_update(acc, i=i):  # dk += (dA_s + dA_s^T) k
-                plgpu.wgmma(acc, das, cols(k_smem, i))
-                plgpu.wgmma(acc, da_smem.T, cols(k_smem, i))
+                mma(acc, das, cols(k_smem, i))
+                mma(acc, da_smem.T, cols(k_smem, i))
 
-            dk = pl.run_state(sym_update)(plgpu.ACC.init(plgpu.load(cols(dk_acc, i), layout=WGMMA)))
+            dk = mma_acc(sym_update, plgpu.load(cols(dk_acc, i), layout=WGMMA))
             dk = lax.optimization_barrier(dk)
             if dk_f32:
                 cols(dk_acc, i)[...] = dk

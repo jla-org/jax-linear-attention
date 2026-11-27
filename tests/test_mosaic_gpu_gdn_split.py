@@ -35,7 +35,7 @@ from jla.ops.mosaic_gpu import gated_delta_rule_kernels as gk
 from jla.ops.mosaic_gpu import scalar_gate as sg
 from jla.ops.mosaic_gpu import scalar_gate_docs as sgd
 
-gpu = pytest.mark.skipif(not cm.is_hopper(), reason="needs an H100 (compute capability 9.0)")
+gpu = pytest.mark.skipif(not (cm.is_hopper() or cm.blackwell_enabled()), reason="needs an H100 (compute capability 9.0), or a Blackwell GPU with JLA_BLACKWELL=1")
 F32, BF16 = jnp.float32, jnp.bfloat16
 HIGHEST = lax.Precision.HIGHEST
 

@@ -45,8 +45,7 @@ from jla.ops.mosaic_gpu._common import (
     decay_matrix,
     finish_together,
     matmul,
-    smem,
-)
+    smem, tc_group, BLACKWELL_STAGING_BYTES, is_blackwell, stage_into)
 
 Array = jax.Array
 F32 = jnp.float32
@@ -56,9 +55,12 @@ SMEM_BUDGET = 220 * 1024
 
 def _stages(per_stage: int, fixed: int) -> int:
     """Deepest input pipeline (2 to 4 stages) that fits the SMEM budget."""
-    for stages in (4, 3, 2):
-        if stages * per_stage + fixed <= SMEM_BUDGET:
-            return stages
+    # Blackwell: prefer leaving room for the SMEM tiles that stage register operands of tcgen05 MMAs.
+    budgets = (SMEM_BUDGET - BLACKWELL_STAGING_BYTES, SMEM_BUDGET) if is_blackwell() else (SMEM_BUDGET,)
+    for budget in budgets:
+        for stages in (4, 3, 2):
+            if stages * per_stage + fixed <= budget:
+                return stages
     raise ValueError(f"fused forward needs {2 * per_stage + fixed} bytes of SMEM")
 
 
@@ -158,6 +160,7 @@ def fused_fwd(
         wg = lax.axis_index("wg")
 
         @pl.when(wg == 2)
+        @tc_group(2)
         def _memory():
             plgpu.set_max_registers(40, action="decrease")
 
@@ -193,6 +196,7 @@ def fused_fwd(
                 plgpu.barrier_wait(in_free.at[n % stages])
 
         @pl.when(wg == 0)
+        @tc_group(0, stage_cols=32 if delta else None)  # Blackwell: the delta pipeline leaves < 8 KB of SMEM
         def _state():
             plgpu.set_max_registers(232, action="increase")
             if has_h0:
@@ -244,6 +248,7 @@ def fused_fwd(
                 plgpu.wait_smem_to_gmem(0)
 
         @pl.when(wg == 1)
+        @tc_group(1, stage_cols=32 if delta else None)
         def _output():
             plgpu.set_max_registers(232, action="increase")
 
@@ -384,6 +389,7 @@ def fused_fwd_wy(
         wg = lax.axis_index("wg")
 
         @pl.when(wg == 2)
+        @tc_group(2)
         def _memory():
             plgpu.set_max_registers(40, action="decrease")
 
@@ -415,6 +421,7 @@ def fused_fwd_wy(
                 plgpu.barrier_wait(in_free.at[n % stages])
 
         @pl.when(wg == 0)
+        @tc_group(0)
         def _state():
             plgpu.set_max_registers(232, action="increase")
             if has_h0:
@@ -434,7 +441,10 @@ def fused_fwd_wy(
                     plgpu.barrier_wait(s_free.at[half])
 
                 s_lo = s_t.astype(dtype)
-                s_pub.at[half][...] = s_lo
+                if is_blackwell():  # store and commit now: the MMA below reads the published tile (no restaging)
+                    s_lo = stage_into(s_lo, s_pub.at[half])
+                else:
+                    s_pub.at[half][...] = s_lo
                 g_last = g_state[slot, C - 1]
                 g_col = plgpu.load(g_state.at[slot], layout=COLS)
                 key_decay = jnp.exp2(g_col)  # Gamma: the correction term reads the incoming state
@@ -469,6 +479,7 @@ def fused_fwd_wy(
                 plgpu.wait_smem_to_gmem(0)
 
         @pl.when(wg == 1)
+        @tc_group(1)
         def _output():
             plgpu.set_max_registers(232, action="increase")
 

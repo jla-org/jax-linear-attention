@@ -66,8 +66,7 @@ from jla.ops.mosaic_gpu._common import (
     matmul,
     num_sms,
     same_run,
-    smem,
-)
+    smem, mma, mma_acc, tc_group)
 from jla.ops.mosaic_gpu.scalar_gate_fused import _stages
 
 Array = jax.Array
@@ -272,6 +271,7 @@ def map_fwd_wy(
         wg = lax.axis_index("wg")
 
         @pl.when(wg == 2)
+        @tc_group(2)
         def _memory():
             plgpu.set_max_registers(40, action="decrease")
 
@@ -300,6 +300,7 @@ def map_fwd_wy(
                 issue(n, slot)
 
         @pl.when(wg == 1)
+        @tc_group(1)
         def _ag():
             plgpu.set_max_registers(232, action="increase")
 
@@ -320,6 +321,7 @@ def map_fwd_wy(
                 plgpu.barrier_arrive(in_free.at[slot])
 
         @pl.when(wg == 0)
+        @tc_group(0)
         def _state():
             plgpu.set_max_registers(232, action="increase")
             shape = (bv, key_dim)
@@ -460,6 +462,7 @@ def _map_fwd_wy_paired(k, v, t0, g2, beta, walk, *, seg, cp, bv, interpret):
             plgpu.barrier_arrive(ag_ready.at[slot])
 
         @pl.when(wg == 2)
+        @tc_group(2)
         def _memory():
             plgpu.set_max_registers(96 if AG_IN_MEMORY_WG else 40, action="decrease")
 
@@ -551,11 +554,13 @@ def _map_fwd_wy_paired(k, v, t0, g2, beta, walk, *, seg, cp, bv, interpret):
         regs = 200 if AG_IN_MEMORY_WG else 232
 
         @pl.when(wg == 1)
+        @tc_group(1)
         def _second():
             plgpu.set_max_registers(regs, action="increase")
             carry(1, vb_s, not AG_IN_MEMORY_WG)
 
         @pl.when(wg == 0)
+        @tc_group(0)
         def _first():
             plgpu.set_max_registers(regs, action="increase")
             carry(0, va_s, False)
@@ -650,6 +655,7 @@ def map_bwd_wy(
         sq = (C, C)
 
         @pl.when(wg == 2)
+        @tc_group(2)
         def _memory():
             plgpu.set_max_registers(40, action="decrease")
 
@@ -679,6 +685,7 @@ def map_bwd_wy(
                 issue(i, slot)
 
         @pl.when(wg == 1)
+        @tc_group(1)
         def _intra():
             plgpu.set_max_registers(232, action="increase")
 
@@ -707,6 +714,7 @@ def map_bwd_wy(
                 plgpu.barrier_arrive(in_free.at[slot])
 
         @pl.when(wg == 0)
+        @tc_group(0)
         def _state():
             plgpu.set_max_registers(232, action="increase")
             ds0 = plgpu.layout_cast(jnp.zeros((bv, key_dim), F32), WGMMA)
@@ -735,10 +743,10 @@ def map_bwd_wy(
                 dwn = (dw_t * bcast_cols(-gam, st)).astype(dtype)
 
                 def update(acc):
-                    plgpu.wgmma(acc, do_t, q_s.at[slot])
-                    plgpu.wgmma(acc, dwn, k_s.at[slot])
+                    mma(acc, do_t, q_s.at[slot])
+                    mma(acc, dwn, k_s.at[slot])
 
-                ds_new = lax.optimization_barrier(pl.run_state(update)(plgpu.ACC.init(ds_t * s_decay)))
+                ds_new = lax.optimization_barrier(mma_acc(update, ds_t * s_decay))
                 plgpu.barrier_arrive(in_free.at[slot])
                 return ds_new
 
@@ -950,9 +958,9 @@ def map_bwd_gla(
             do_t = (do_t * bcast_cols(q_scale, (bv, C))).astype(dtype)
 
             def update(acc):
-                plgpu.wgmma(acc, do_t, q_smem.at[slot])
+                mma(acc, do_t, q_smem.at[slot])
 
-            return pl.run_state(update)(plgpu.ACC.init(ds_t * s_decay))
+            return mma_acc(update, ds_t * s_decay)
 
         ds_t = lax.fori_loop(0, count, step, ds0)
         state_smem[...] = ds_t

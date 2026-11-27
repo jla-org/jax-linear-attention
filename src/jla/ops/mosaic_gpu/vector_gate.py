@@ -47,7 +47,8 @@ import jax.experimental.pallas.mosaic_gpu as plgpu
 import jax.numpy as jnp
 from jax import lax
 
-from jla.ops.mosaic_gpu._common import finish_together
+from jla.ops.mosaic_gpu import _common as _cm
+from jla.ops.mosaic_gpu._common import finish_together, is_blackwell, matmul as _tc_matmul, mma, mma_acc, tc_group
 
 Array = jax.Array
 
@@ -83,18 +84,75 @@ class Config:
         return self.seq_len // CHUNK
 
 
+def _tc05(cfg: Config) -> bool:
+    """Blackwell: the products run as tcgen05 MMAs through TMEM (``_common``), never in the interpreter."""
+    return is_blackwell() and not cfg.interpret
+
+
 def _kernel(cfg: Config, name: str, body, **kwargs):
     # Lane semantics: SMEM buffers keep exactly the transforms given here. Warpgroup semantics
     # infers tilings/swizzles for untransformed scratch, which breaks row-shifted views.
     params = plgpu.CompilerParams(lowering_semantics=plgpu.LoweringSemantics.Lane, approx_math=True)
     interpret = plgpu.InterpretGPUParams() if cfg.interpret else None
+    if _tc05(cfg) and kwargs.get("num_threads"):
+        return _planned_kernel(name, body, params, **kwargs)
     return plgpu.kernel(body, interpret=interpret, kernel_name=name, compiler_params=params, **kwargs)
 
 
+def _planned_kernel(name: str, body, params, *, scratch_types, **kwargs):
+    """Blackwell, warp-specialized: ``_common.build_kernel``'s two-pass TMEM plan with Lane semantics.
+
+    The first trace records every tensor-core call site's TMEM buffers and barriers, the second
+    hands them out from kernel-level scratch appended after ``scratch_types`` (see ``_common``).
+    """
+
+    def make(fn, scratch):
+        return plgpu.kernel(fn, kernel_name=name, compiler_params=params, scratch_types=scratch, **kwargs)
+
+    def call(*args):
+        plan = _cm._TcPlan()
+
+        def recording_body(*refs):
+            _cm._PLAN = plan
+            try:
+                body(*refs)
+            finally:
+                _cm._PLAN = None
+            raise _cm._NeedPlan
+
+        try:
+            make(recording_body, scratch_types)(*args)
+        except _cm._NeedPlan:
+            pass
+        if not plan.pools:
+            return make(body, scratch_types)(*args)
+        refs, nbars, sizes, cols = plan.layout()
+        if cols > _cm.TMEM_COLS:
+            raise NotImplementedError(f"{name}: Blackwell products need {cols} TMEM columns (> {_cm.TMEM_COLS})")
+        bars = plgpu.Barrier(num_arrivals=1, num_barriers=max(nbars, 2), orders_tensor_core=True)
+
+        def planned_body(*all_refs):
+            *own, tc_refs, tc_bars = all_refs
+            _cm._PLAN = _cm._TcPlan(sizes, list(tc_refs), tc_bars)
+            try:
+                body(*own)
+            finally:
+                _cm._PLAN = None
+
+        return make(planned_body, (*scratch_types, list(refs), bars))(*args)
+
+    return call
+
+
 def _swizzled(shape: tuple[int, ...], dtype=_BF16) -> plgpu.SMEM:
-    """SMEM tiled and swizzled for its minor dimension (WGMMA operands, conflict-free loads)."""
+    """SMEM tiled and swizzled for its minor dimension (WGMMA operands, conflict-free loads).
+
+    Blackwell: capped at 32 elements, as ``_common.smem`` (each N half of an M=64 tcgen05 MMA must
+    hold whole swizzle atoms)."""
     itemsize = jnp.dtype(dtype).itemsize
     swizzle = plgpu.find_swizzle(shape[-1] * itemsize * 8)
+    if is_blackwell():
+        swizzle = min(swizzle, 32 * itemsize)
     transforms = (plgpu.TilingTransform((8, swizzle // itemsize)), plgpu.SwizzleTransform(swizzle))
     return plgpu.SMEM(shape, dtype, transforms=transforms)
 
@@ -105,6 +163,22 @@ def _iota(shape: tuple[int, int], dim: int) -> Array:
 
 def _load(ref, layout=_WG) -> Array:
     return plgpu.load(ref, layout=layout, optimized=False)
+
+
+_STORE = getattr(plgpu, "store", None)  # JAX >= 0.12
+
+
+def _put(ref, value, idx=...) -> None:
+    """``ref[idx] = value`` for an untiled SMEM ref or a GMEM ref, unoptimized on every JAX version.
+
+    JAX 0.11 lowered such a store unoptimized; JAX 0.12 requires a bank-conflict-free transfer plan
+    for it and fails on the row-shifted, padded-pitch buffers of these kernels. On JAX < 0.12 this is
+    exactly ``ref[idx] = value``.
+    """
+    if _STORE is None:
+        ref[idx] = value
+    else:
+        _STORE(ref if idx is ... else ref.at[idx], value, optimized=False)
 
 
 def _rows(x: Array, shape: tuple[int, int]) -> Array:
@@ -145,6 +219,15 @@ def _matmul(cfg: Config, shape: tuple[int, int], *pairs, init: Array | None = No
 
         return pl.run_scoped(staged, *(_swizzled(pairs[i][0].value.shape) for i in regs))
     pairs = tuple((a.value if isinstance(a, _Regs) else a, b) for a, b in pairs)
+    if _tc05(cfg):  # tcgen05 through TMEM; register operands are staged through SMEM by _common
+        if init is None and len(pairs) == 1:
+            return _tc_matmul(pairs[0][0], pairs[0][1], shape)
+
+        def tc_body(acc):
+            for a, b in pairs:
+                mma(acc, a, b)
+
+        return mma_acc(tc_body, plgpu.layout_cast(jnp.zeros(shape, _F32), _WG) if init is None else init)
     if cfg.interpret and init is not None:
         # The interpreter cannot run ``pl.run_state`` on an initialised accumulator.
         return init + _matmul(cfg, shape, *pairs)
@@ -194,6 +277,46 @@ def _wgmma(cfg: Config, acc, a, b, stage=None) -> None:
         stage[...] = a.value
         plgpu.commit_smem()
         plgpu.wgmma(acc, stage, b)
+
+
+def _slab_loop(cfg: Config, shapes, slab_body, stage, finish):
+    """f32 accumulators of ``shapes`` summed over the ``_KC``-column key slabs.
+
+    ``slab_body(slab, issue)`` computes one slab's operands and calls ``issue(i, a, b)`` for
+    ``acc_i += a @ b``; ``finish(get)`` runs once all slabs are done, ``get(i)`` reading
+    accumulator ``i``. Hopper: WGMMA accumulators across the loop with one wait per slab (the code
+    of the kernels before the Blackwell port). Blackwell: the sums are carried in registers through
+    the loop and each product is a synchronous ``_common.matmul`` on top of its running sum (an
+    MMA must not be in flight across the loop back-edge, and ``_common.mma_acc`` takes no loop).
+    """
+    count = cfg.key_dim // _KC
+    if _tc05(cfg):
+
+        def tc_step(slab, sums):
+            sums = list(sums)
+
+            def issue(i, a, b):
+                sums[i] = _tc_matmul(a.value if isinstance(a, _Regs) else a, b, shapes[i], init=sums[i])
+
+            slab_body(slab, issue)
+            return tuple(sums)
+
+        zeros = tuple(plgpu.layout_cast(jnp.zeros(shape, _F32), _WG) for shape in shapes)
+        sums = lax.fori_loop(0, count, tc_step, zeros)
+        return finish(lambda i: sums[i])
+
+    def scoped(*accs):
+        def slab_step(slab, carry):
+            slab_body(slab, lambda i, a, b: _wgmma(cfg, accs[i], a, b, stage))
+            # Accumulators allocated outside a loop must not have wgmmas in flight across its
+            # back-edge (the results came out corrupted without this wait).
+            plgpu.wgmma_wait(0)
+            return carry
+
+        lax.fori_loop(0, count, slab_step, None)
+        return finish(lambda i: accs[i][...])
+
+    return pl.run_scoped(scoped, *[plgpu.ACC(shape, _F32) for shape in shapes])
 
 
 def _per_block(blocks: Array, values: list[Array | None], shape: tuple[int, int]) -> Array:
@@ -257,9 +380,9 @@ def _scan(cfg: Config, x: Array, *, reverse: bool, resets: Array | None = None) 
                 if r_ref is not None:
                     val = val - RESET_DECAY * r_ref[b, n * CHUNK + group * step_rows + r]
                 acc = acc + val
-                row[...] = acc
+                _put(row, acc)
             if not reverse:
-                marks_smem.at[group][...] = acc
+                _put(marks_smem.at[group], acc)
             return acc
 
         lax.fori_loop(0, _MARKS, step, plgpu.layout_cast(jnp.zeros((SCAN_WIDTH,), _F32), line))
@@ -331,33 +454,49 @@ def _below_diagonal(cfg: Config, refs, x_smem, stage) -> list[Array]:
     shape = (c, _KC)
     blocks = _iota(shape, 0) >> 4
     tile = (c, SUB_CHUNK)
+    n_acc = 2 * (_NUM_SUB - 1)
+    tc05 = _tc05(cfg)
 
-    def scoped(*accs):
-        def slab_step(slab, carry):
-            cols, g, q, k, kr = _slab_inputs(cfg, slab, q_smem, k_smem, e_smem, g_smem)
-            ends = [_load(marks_smem.at[2 * blk + 1, cols], _COL) for blk in range(_NUM_SUB)]
-            x_smem.at[:, cols][...] = (k * jnp.exp(_per_block(blocks, ends, shape) - g)).astype(_BF16)
+    def slab_body(slab, issue):
+        cols, g, q, k, kr = _slab_inputs(cfg, slab, q_smem, k_smem, e_smem, g_smem)
+        ends = [_load(marks_smem.at[2 * blk + 1, cols], _COL) for blk in range(_NUM_SUB)]
+        x_val = k * jnp.exp(_per_block(blocks, ends, shape) - g)
+        if tc05:
+            # Blackwell: an M=64 tcgen05 MMA with a 64-byte RHS swizzle needs N >= 64, so column block J
+            # is an N=64 product with every key row outside block J zeroed in x_smem (rewritten per J;
+            # the products are synchronous), summed into one [C, C] accumulator per left operand.
             decay_in = _masked_exp(g - _per_block(blocks, [None, *ends[:-1]], shape), blocks >= 1)
             qy, ky = q * decay_in, kr * decay_in
-            plgpu.commit_smem()
             one = plgpu.layout_cast(jnp.ones((_KC,), _F32), _COL)
             for col_blk in range(_NUM_SUB - 1):
                 factors = [None] * (col_blk + 1) + [one] + [
                     jnp.exp(ends[row_blk - 1] - ends[col_blk]) for row_blk in range(col_blk + 2, _NUM_SUB)
                 ]
                 factor = _per_block(blocks, factors, shape)
-                rhs = x_smem.at[pl.ds(SUB_CHUNK * col_blk, SUB_CHUNK), cols].T
-                _wgmma(cfg, accs[2 * col_blk], _Regs((qy * factor).astype(_BF16)), rhs, stage)
-                _wgmma(cfg, accs[2 * col_blk + 1], _Regs((ky * factor).astype(_BF16)), rhs, stage)
-            # Accumulators allocated outside a loop must not have wgmmas in flight across its
-            # back-edge (the results came out corrupted without this wait).
-            plgpu.wgmma_wait(0)
-            return carry
+                x_smem.at[:, cols][...] = jnp.where(blocks == col_blk, x_val, 0.0).astype(_BF16)
+                plgpu.commit_smem()
+                rhs = x_smem.at[:, cols].T
+                issue(0, _Regs((qy * factor).astype(_BF16)), rhs)
+                issue(1, _Regs((ky * factor).astype(_BF16)), rhs)
+            return
+        x_smem.at[:, cols][...] = x_val.astype(_BF16)
+        decay_in = _masked_exp(g - _per_block(blocks, [None, *ends[:-1]], shape), blocks >= 1)
+        qy, ky = q * decay_in, kr * decay_in
+        plgpu.commit_smem()
+        one = plgpu.layout_cast(jnp.ones((_KC,), _F32), _COL)
+        for col_blk in range(_NUM_SUB - 1):
+            factors = [None] * (col_blk + 1) + [one] + [
+                jnp.exp(ends[row_blk - 1] - ends[col_blk]) for row_blk in range(col_blk + 2, _NUM_SUB)
+            ]
+            factor = _per_block(blocks, factors, shape)
+            rhs = x_smem.at[pl.ds(SUB_CHUNK * col_blk, SUB_CHUNK), cols].T
+            issue(2 * col_blk, _Regs((qy * factor).astype(_BF16)), rhs)
+            issue(2 * col_blk + 1, _Regs((ky * factor).astype(_BF16)), rhs)
 
-        lax.fori_loop(0, cfg.key_dim // _KC, slab_step, None)
-        return [acc[...] for acc in accs]
-
-    return pl.run_scoped(scoped, *[plgpu.ACC(tile, _F32) for _ in range(2 * (_NUM_SUB - 1))])
+    if tc05:  # column block J of the [C, C] sums (P_J, Q_J, ...)
+        sums = _slab_loop(cfg, [(c, c)] * 2, slab_body, stage, lambda get: [get(0), get(1)])
+        return [sums[i % 2][:, SUB_CHUNK * (i // 2):SUB_CHUNK * (i // 2 + 1)] for i in range(n_acc)]
+    return _slab_loop(cfg, [tile] * n_acc, slab_body, stage, lambda get: [get(i) for i in range(n_acc)])
 
 
 def _half_blocks(cfg: Config, refs, x2_smem, out_smem, stage) -> None:
@@ -375,25 +514,22 @@ def _half_blocks(cfg: Config, refs, x2_smem, out_smem, stage) -> None:
     blocks = rows >> 4
     second = (rows & (SUB_CHUNK - 1)) >= _HALF
 
-    def scoped(acc_q, acc_k):
-        def slab_step(slab, carry):
-            cols, g, q, k, kr = _slab_inputs(cfg, slab, q_smem, k_smem, e_smem, g_smem)
-            mids = [_load(marks_smem.at[2 * blk, cols], _COL) for blk in range(_NUM_SUB)]
-            mid = _per_block(blocks, mids, shape)
-            decay = jnp.exp(jnp.where(second, g - mid, mid - g))
-            x2_smem.at[:, cols][...] = jnp.where(second, 0.0, k * decay).astype(_BF16)
-            plgpu.commit_smem()
-            rhs = x2_smem.at[:, cols].T
-            _wgmma(cfg, acc_q, _Regs(jnp.where(second, q * decay, 0.0).astype(_BF16)), rhs, stage)
-            _wgmma(cfg, acc_k, _Regs(jnp.where(second, kr * decay, 0.0).astype(_BF16)), rhs, stage)
-            plgpu.wgmma_wait(0)  # no wgmma in flight across the loop back-edge (see _below_diagonal)
-            return carry
+    def slab_body(slab, issue):
+        cols, g, q, k, kr = _slab_inputs(cfg, slab, q_smem, k_smem, e_smem, g_smem)
+        mids = [_load(marks_smem.at[2 * blk, cols], _COL) for blk in range(_NUM_SUB)]
+        mid = _per_block(blocks, mids, shape)
+        decay = jnp.exp(jnp.where(second, g - mid, mid - g))
+        x2_smem.at[:, cols][...] = jnp.where(second, 0.0, k * decay).astype(_BF16)
+        plgpu.commit_smem()
+        rhs = x2_smem.at[:, cols].T
+        issue(0, _Regs(jnp.where(second, q * decay, 0.0).astype(_BF16)), rhs)
+        issue(1, _Regs(jnp.where(second, kr * decay, 0.0).astype(_BF16)), rhs)
 
-        lax.fori_loop(0, cfg.key_dim // _KC, slab_step, None)
-        out_smem[0] = acc_q[...]
-        out_smem[1] = acc_k[...]
+    def finish(get):
+        _put(out_smem, get(0), 0)
+        _put(out_smem, get(1), 1)
 
-    pl.run_scoped(scoped, plgpu.ACC((c, c), _F32), plgpu.ACC((c, c), _F32))
+    _slab_loop(cfg, [(c, c)] * 2, slab_body, stage, finish)
 
 
 def _diag_tiles(cfg: Config, slabs: range, refs, kpad, epad) -> tuple[Array, Array]:
@@ -418,10 +554,10 @@ def _diag_tiles(cfg: Config, slabs: range, refs, kpad, epad) -> tuple[Array, Arr
     def slab_step(slab, carry):
         diag_q, diag_k = carry
         cols, g, q, k, kr = _slab_inputs(cfg, slab, q_smem, k_smem, e_smem, g_smem)
-        kpad.at[rows, data][...] = _load(k_smem.at[:, cols])
-        epad.at[rows, data][...] = g
+        _put(kpad.at[rows, data], _load(k_smem.at[:, cols]))
+        _put(epad.at[rows, data], g)
         g_prev = _load(epad.at[pl.ds(_PAD - 1, c), data])
-        epad.at[rows, data][...] = jnp.exp(g - g_prev)
+        _put(epad.at[rows, data], jnp.exp(g - g_prev))
         diag_q = diag_q + jnp.where(col == offset, _rows(jnp.sum(q * k, axis=1), tile), 0.0)
 
         def offset_step(d, carry):
@@ -457,29 +593,30 @@ def _factored_blocks(cfg: Config, refs, keys: bool, xd_smem, xo_smem, stage) -> 
     shape = (CHUNK, _KC)
     second = _iota(shape, 0) >= _BLOCK
     halves = pl.ds(0, _BLOCK), pl.ds(_BLOCK, _BLOCK)
+    tc05 = _tc05(cfg)
 
-    def scoped(acc0, acc1, acc_off):
-        def slab_step(slab, carry):
-            cols, g, q, k, kr = _slab_inputs(cfg, slab, q_smem, k_smem, e_smem, g_smem)
-            m15, m31, m47 = (_cols(_load(marks_smem.at[i, cols], _COL), shape) for i in (1, 3, 5))
-            mid = jnp.where(second, m47, m15)
-            to_31 = jnp.exp(jnp.where(second, g - m31, m31 - g))  # at most one in both halves
-            xd_smem[...] = (k * jnp.exp(mid - g)).astype(_BF16)
-            xo_smem[...] = (k * to_31).astype(_BF16)  # rows 0-31 are the lower-left block's right operand
-            plgpu.commit_smem()
-            x = kr if keys else q
-            left = _Regs((x * jnp.exp(g - mid)).astype(_BF16))
-            _wgmma(cfg, acc0, left, xd_smem.at[halves[0]].T, stage)
-            _wgmma(cfg, acc1, left, xd_smem.at[halves[1]].T, stage)
-            _wgmma(cfg, acc_off, _Regs(jnp.where(second, x * to_31, 0.0).astype(_BF16)), xo_smem.at[halves[0]].T,
-                   stage)
-            plgpu.wgmma_wait(0)  # no wgmma in flight across the loop back-edge (see _below_diagonal)
-            return carry
+    def slab_body(slab, issue):
+        cols, g, q, k, kr = _slab_inputs(cfg, slab, q_smem, k_smem, e_smem, g_smem)
+        m15, m31, m47 = (_cols(_load(marks_smem.at[i, cols], _COL), shape) for i in (1, 3, 5))
+        mid = jnp.where(second, m47, m15)
+        to_31 = jnp.exp(jnp.where(second, g - m31, m31 - g))  # at most one in both halves
+        xd_smem[...] = (k * jnp.exp(mid - g)).astype(_BF16)
+        xo_smem[...] = (k * to_31).astype(_BF16)  # rows 0-31 are the lower-left block's right operand
+        plgpu.commit_smem()
+        x = kr if keys else q
+        left = _Regs((x * jnp.exp(g - mid)).astype(_BF16))
+        if tc05:  # Blackwell: N=64 products (see _below_diagonal); both halves of xd at once, xo's first half kept
+            issue(0, left, xd_smem.T)
+            issue(1, _Regs(jnp.where(second, x * to_31, 0.0).astype(_BF16)), xo_smem.T)
+            return
+        issue(0, left, xd_smem.at[halves[0]].T)
+        issue(1, left, xd_smem.at[halves[1]].T)
+        issue(2, _Regs(jnp.where(second, x * to_31, 0.0).astype(_BF16)), xo_smem.at[halves[0]].T)
 
-        lax.fori_loop(0, cfg.key_dim // _KC, slab_step, None)
-        return [acc0[...], acc1[...], acc_off[...]]
-
-    return pl.run_scoped(scoped, *[plgpu.ACC((CHUNK, _BLOCK), _F32) for _ in range(3)])
+    if tc05:
+        full = _slab_loop(cfg, [(CHUNK, CHUNK)] * 2, slab_body, stage, lambda get: [get(0), get(1)])
+        return [full[0][:, :_BLOCK], full[0][:, _BLOCK:], full[1][:, :_BLOCK]]
+    return _slab_loop(cfg, [(CHUNK, _BLOCK)] * 3, slab_body, stage, lambda get: [get(0), get(1), get(2)])
 
 
 def _store_factored(parts: list[Array], out_smem, *, strict: bool, row_scale: Array | None, scale: float) -> None:
@@ -495,7 +632,7 @@ def _store_factored(parts: list[Array], out_smem, *, strict: bool, row_scale: Ar
     )):
         if row_scale is not None:
             val = val * row_scale
-        out_smem.at[:, pl.ds(half * _BLOCK, _BLOCK)][...] = (val * scale).astype(out_smem.dtype)
+        _put(out_smem.at[:, pl.ds(half * _BLOCK, _BLOCK)], (val * scale).astype(out_smem.dtype))
 
 
 def _split_slabs(key_dim: int) -> tuple[range, range]:
@@ -665,6 +802,7 @@ def intra(
         slab_pair = pl.ds(0, _KC), pl.ds(_KC, _KC)  # per-slab right operands of the factored path
 
         @pl.when(jnp.logical_and(factored, wg == 0))
+        @tc_group(0, stage_cols=_KC)  # Blackwell: register operands are _KC deep
         def _():
             parts = _factored_blocks(cfg, refs, False, x_smem.at[:, slab_pair[0]], x_smem.at[:, slab_pair[1]],
                                      None if stage is None else stage.at[0])
@@ -676,6 +814,7 @@ def intra(
             plgpu.wait_smem_to_gmem(0)
 
         @pl.when(jnp.logical_and(factored, wg == 1))
+        @tc_group(1, stage_cols=_KC)
         def _():
             parts = _factored_blocks(cfg, refs, True, x2_smem.at[:, slab_pair[0]], x2_smem.at[:, slab_pair[1]],
                                      None if stage is None else stage.at[1])
@@ -691,11 +830,12 @@ def intra(
             plgpu.wait_smem_to_gmem(0)
 
         @pl.when(jnp.logical_and(jnp.logical_not(factored), wg == 1))
+        @tc_group(1, stage_cols=_KC)
         def _():
             _half_blocks(cfg, refs, x2_smem, half_smem, None if stage is None else stage.at[1])
             diag_q, diag_k = _diag_tiles(cfg, wg_slabs[1], refs, kpad.at[1], epad.at[1])
-            diag_smem[0] = diag_q
-            diag_smem[1] = diag_k
+            _put(diag_smem, diag_q, 0)
+            _put(diag_smem, diag_k, 1)
             plgpu.barrier_arrive(done_bar)
             store_keys(wait=not solve)
             if solve:
@@ -704,6 +844,7 @@ def intra(
                 plgpu.wait_smem_to_gmem(0)
 
         @pl.when(jnp.logical_and(jnp.logical_not(factored), wg == 0))
+        @tc_group(0, stage_cols=_KC)
         def _():
             below = _below_diagonal(cfg, refs, x_smem, None if stage is None else stage.at[0])
             if wg_slabs[0]:
@@ -724,9 +865,9 @@ def intra(
                     off = below[2 * col_blk + idx] if col_blk < _NUM_SUB - 1 else jnp.zeros(tile, _F32)
                     val = jnp.where(blocks == col_blk, diag + quad, off)
                     if idx == 0:
-                        out_smem.at[:, cols][...] = (val * cfg.scale).astype(_BF16)
+                        _put(out_smem.at[:, cols], (val * cfg.scale).astype(_BF16))
                     else:
-                        out_smem.at[:, cols][...] = val if beta is None else val * beta
+                        _put(out_smem.at[:, cols], val if beta is None else val * beta)
             plgpu.commit_smem()
             if solve:
                 plgpu.barrier_arrive(akk_ready)
@@ -821,7 +962,7 @@ def _unit_lower_inverse(cfg: Config, a_smem, scratch) -> Array:
     for blk in range(_NUM_SUB):
         part = _load(a_smem.at[:, pl.ds(SUB_CHUNK * blk, SUB_CHUNK)])
         adiag = part if adiag is None else jnp.where(tblocks == blk, part, adiag)
-    s_smem[...] = eye
+    _put(s_smem, eye)
     s = eye
     tcol = _iota(tile, 1)
     for j in range(SUB_CHUNK - 1):  # unrolled: static pivots, coefficients taken from registers
@@ -829,9 +970,9 @@ def _unit_lower_inverse(cfg: Config, a_smem, scratch) -> Array:
         pivot = _per_block(tblocks, [_load(s_smem.at[SUB_CHUNK * blk + j], _COL) for blk in range(_NUM_SUB)], tile)
         coef = _rows(jnp.sum(jnp.where(tcol == j, adiag, 0.0), axis=1), tile)
         s = jnp.where(offset > j, s - coef * pivot, s)
-        s_smem[...] = s
+        _put(s_smem, s)
     for blk in range(_NUM_SUB):
-        d1_smem.at[:, pl.ds(SUB_CHUNK * blk, SUB_CHUNK)][...] = jnp.where(tblocks == blk, s, 0.0)
+        _put(d1_smem.at[:, pl.ds(SUB_CHUNK * blk, SUB_CHUNK)], jnp.where(tblocks == blk, s, 0.0))
     d1 = _load(d1_smem)
     a = _load(a_smem)
     rblocks = _iota(full, 0) >> 4
@@ -918,7 +1059,7 @@ def wy(
         k_smem[...] = (kf * decay * erase_v).astype(_BF16)  # the right operands overwrite the inputs
         q_smem[...] = (_load(q_smem).astype(_F32) * decay * cfg.scale).astype(_BF16)
         v_smem[...] = (_load(v_smem).astype(_F32) * write_v).astype(_BF16)
-        tm = _Regs(_load(t_smem))
+        tm = t_smem if _tc05(cfg) else _Regs(_load(t_smem))  # Blackwell: the MMA reads T from SMEM
         plgpu.commit_smem()
         w_val = _matmul(cfg, (c, kd), (tm, k_smem))
         u_val = _matmul(cfg, (c, vd), (tm, v_smem))
@@ -958,8 +1099,23 @@ def _key_tiles(cfg: Config, shape: tuple[int, ...]) -> plgpu.SMEM:
     """bf16 operand ``[.., C, K]`` or ``[.., C, C]`` of the state kernels whose WGMMA partner is a
     ``block_v``-wide value-side tile: both need the same swizzle (that of a ``block_v`` row)."""
     swizzle = min(2 * cfg.block_v, 128)
+    if is_blackwell():  # the cap of _swizzled (32 elements)
+        swizzle = min(swizzle, 64)
     transforms = (plgpu.TilingTransform((8, swizzle // 2)), plgpu.SwizzleTransform(swizzle))
     return plgpu.SMEM(shape, _BF16, transforms=transforms)
+
+
+def _state_rows(cfg: Config) -> list:
+    """Row blocks of a ``[K, block_v]`` state: the whole state (``None``), or 64-row blocks on
+    Blackwell (tcgen05 products run with 64-row tiles only)."""
+    if _tc05(cfg) and cfg.key_dim > CHUNK:
+        return [pl.ds(r, CHUNK) for r in range(0, cfg.key_dim, CHUNK)]
+    return [None]
+
+
+def _rows_of(rows):
+    """The index of a row block of :func:`_state_rows` (``:`` for the whole state)."""
+    return slice(None) if rows is None else rows
 
 
 def state_output(
@@ -1003,6 +1159,8 @@ def state_output(
     and ``write`` the write gate, ``beta [B, H, T]`` f32 or ``w [B, T, H, V]`` bf16.
     """
     c, kd, vd, bv, nc = CHUNK, cfg.key_dim, cfg.value_dim, cfg.block_v, cfg.num_chunks
+    if _tc05(cfg) and bv < 64:  # an N=32 tcgen05 product needs a swizzle below the 32-element SMEM tiles
+        raise NotImplementedError(f"Blackwell state_output needs block_v >= 64; got {bv}")
     fused = t is not None
     if fused != (write is not None):
         raise ValueError("state_output takes t and write together")
@@ -1041,11 +1199,13 @@ def state_output(
             b, piece, first, count, skip, last_piece = bp, 0, 0, nc, 0, 1
         wg = lax.axis_index("wg")
         vcols = pl.ds(vt * bv, bv)
+        row_blocks = _state_rows(cfg)
 
         def chunk(i):  # the chunk of the walk's step i
             return first + i if split else i
 
         @pl.when(wg == 0 if not split else (wg == 0) & (count > 0))  # an empty piece walks nothing
+        @tc_group(0)
         def _():
             def fetch(i, slot):
                 n = chunk(i)
@@ -1063,12 +1223,16 @@ def state_output(
                 plgpu.copy_gmem_to_smem(gl_ref.at[b, n, h], gl_smem.at[slot], bar)
 
             fetch(0, 0)
-            if has_h0:
-                s0 = _load(h0_ref.at[b, h, :, vcols])
-                if split:  # a later piece starts in a segment's first chunk: no state enters it
-                    s0 = s0 * (piece == 0).astype(_F32)
-            else:
-                s0 = plgpu.layout_cast(jnp.zeros((kd, bv), _F32), _WG)
+            s0 = []
+            for rows in row_blocks:  # one block (Hopper), 64-row blocks (Blackwell)
+                if has_h0:
+                    s_blk = _load(h0_ref.at[b, h, _rows_of(rows), vcols])
+                    if split:  # a later piece starts in a segment's first chunk: no state enters it
+                        s_blk = s_blk * (piece == 0).astype(_F32)
+                else:
+                    s_blk = plgpu.layout_cast(jnp.zeros((kd // len(row_blocks), bv), _F32), _WG)
+                s0.append(s_blk)
+            s0 = tuple(s0)
 
             def step(i, s):
                 n = chunk(i)
@@ -1087,7 +1251,11 @@ def state_output(
 
                 if save:
                     plgpu.wait_smem_to_gmem(0, wait_read_only=True)  # the previous chunk's stores read them
-                s_smem[...] = s.astype(_BF16)
+                for rows, s_blk in zip(row_blocks, s):
+                    if rows is None:
+                        s_smem[...] = s_blk.astype(_BF16)
+                    else:
+                        s_smem.at[rows][...] = s_blk.astype(_BF16)
                 plgpu.commit_smem()
                 if save:
                     stored(i, skip, lambda: plgpu.copy_smem_to_gmem(s_smem, outs[2].at[b, h, n, :, vcols],
@@ -1117,14 +1285,24 @@ def state_output(
 
                     stored(i, skip, store_v_new)
                 plgpu.barrier_arrive(ready)
-                decay = jnp.exp(_load(gl_smem.at[slot], _ROW))
-                s = s * _rows(decay, (kd, bv))
-                return _matmul(cfg, (kd, bv), (kg_smem.at[slot].T, vn_smem), init=s)
+                s_new = []
+                for rows, s_blk in zip(row_blocks, s):
+                    shape = s_blk.shape
+                    if rows is None:
+                        decay = jnp.exp(_load(gl_smem.at[slot], _ROW))
+                        keys_t = kg_smem.at[slot].T
+                    else:
+                        decay = jnp.exp(_load(gl_smem.at[slot, rows], _ROW))
+                        keys_t = kg_smem.at[slot, :, rows].T
+                    s_blk = s_blk * _rows(decay, shape)
+                    s_new.append(_matmul(cfg, shape, (keys_t, vn_smem), init=s_blk))
+                return tuple(s_new)
 
             s = lax.fori_loop(0, count, step, s0)
 
             def store_final():
-                final_ref.at[b, h, :, vcols][...] = s
+                for rows, s_blk in zip(row_blocks, s):
+                    _put(final_ref.at[b, h, _rows_of(rows), vcols], s_blk)
 
             if split:  # one piece per row (its last non-empty one) writes the final state
                 pl.when(last_piece == 1)(store_final)
@@ -1135,6 +1313,7 @@ def state_output(
                 plgpu.wait_smem_to_gmem(0)
 
         @pl.when(wg == 1 if not split else (wg == 1) & (count > 0))
+        @tc_group(1)
         def _():
             def fetch(i, slot):
                 tok = pl.ds(chunk(i) * c, c)

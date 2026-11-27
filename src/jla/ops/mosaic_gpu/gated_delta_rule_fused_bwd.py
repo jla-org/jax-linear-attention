@@ -55,8 +55,7 @@ from jla.ops.mosaic_gpu._common import (
     iota,
     matmul,
     same_run,
-    smem,
-)
+    smem, mma, mma_acc, tc_group)
 
 Array = jax.Array
 F32 = jnp.float32
@@ -211,6 +210,7 @@ def fused_bwd(
                 plgpu.set_max_registers(n, action="increase" if n > LAUNCH_REGISTERS else "decrease")
 
         @pl.when(wg == 0)
+        @tc_group(0)
         def _forward_side():
             set_registers(REGISTERS[0])
             if has_dht:
@@ -282,6 +282,7 @@ def fused_bwd(
                 plgpu.barrier_arrive(wg0_done)
 
         @pl.when(wg == 1)
+        @tc_group(1)
         def _backward_side():
             set_registers(REGISTERS[1])
 
@@ -351,12 +352,12 @@ def fused_bwd(
                 plgpu.barrier_wait(dp_ready)
 
                 def update(acc):
-                    plgpu.wgmma(acc, dvn_s, h_s)  # -Gamma (dW S^T)
-                    plgpu.wgmma(acc, dp_s.T, q_s)  # dP^T q
-                    plgpu.wgmma(acc, das, k_s)
-                    plgpu.wgmma(acc, t_s.T, k_s)
+                    mma(acc, dvn_s, h_s)  # -Gamma (dW S^T)
+                    mma(acc, dp_s.T, q_s)  # dP^T q
+                    mma(acc, das, k_s)
+                    mma(acc, t_s.T, k_s)
 
-                dk = lax.optimization_barrier(pl.run_state(update)(plgpu.ACC.init(dks)))
+                dk = lax.optimization_barrier(mma_acc(update, dks))
                 w_s[...] = dk.astype(dtype)  # W was last read by the dAg product
                 plgpu.commit_smem()
                 plgpu.copy_smem_to_gmem(w_s, dk_ref.at[b, rows, hh])
@@ -386,6 +387,7 @@ def fused_bwd(
             plgpu.wait_smem_to_gmem(0)
 
         @pl.when(wg == 2)
+        @tc_group(2)
         def _state():
             set_registers(REGISTERS[2])
             if has_dht:
@@ -408,16 +410,16 @@ def fused_bwd(
                 plgpu.barrier_wait(qg_ready)
 
                 def with_queries(acc):  # gamma dS^T + do^T (scale Gamma q)
-                    plgpu.wgmma(acc, do_s.T, qg_s)
+                    mma(acc, do_s.T, qg_s)
 
-                ds_t = lax.optimization_barrier(pl.run_state(with_queries)(plgpu.ACC.init(ds_t * s_decay)))
+                ds_t = lax.optimization_barrier(mma_acc(with_queries, ds_t * s_decay))
                 plgpu.barrier_arrive(do_free)
                 plgpu.barrier_wait(dvn_ready)
 
                 def with_values(acc):  # - (Gamma dW)^T k
-                    plgpu.wgmma(acc, dvn_s.T, k_s)
+                    mma(acc, dvn_s.T, k_s)
 
-                ds_t = lax.optimization_barrier(pl.run_state(with_values)(plgpu.ACC.init(ds_t)))
+                ds_t = lax.optimization_barrier(mma_acc(with_values, ds_t))
                 plgpu.barrier_arrive(free)
                 plgpu.barrier_wait(free)  # WG1 has read dS' of this chunk
                 return ds_t

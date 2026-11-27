@@ -3,6 +3,37 @@
 Notable changes to jax-linear-attention. Versions follow [semantic versioning](https://semver.org/);
 before 1.0 a minor release may change APIs.
 
+## 0.2.0 - 2026-11-27
+
+### Kernels
+
+- Datacenter Blackwell support (opt-in, `JLA_BLACKWELL=1`): the Gated DeltaNet, DeltaNet, simple GLA
+  (Mamba-2 style) and KDA kernels run on B200 (sm_100) and B300 (sm_103) through tcgen05 tensor-core
+  products with accumulators in tensor memory, behind the same helpers as the Hopper WGMMA code
+  (`_common.matmul`, `mma`, `mma_acc`, `products`). 64-row tiles only; register operands are staged
+  through shared memory; warp-specialized kernels plan their tensor-memory and barrier scratch in a
+  two-pass trace (`tc_group`). Forward + backward against FLA's Triton kernels on the same GPU: Gated
+  DeltaNet 1.55-1.98x on B200 and 1.54-2.00x on B300, KDA 1.43-1.53x on B200.
+- On B200-class GPUs (148 SMs), Gated DeltaNet calls of 64 CTAs split each sequence into two pieces.
+- Gated DeltaNet's `wy_bwd` now synchronizes the warpgroup between a column-layout shared-memory store
+  and the row-layout load that reads it (this also changes the Hopper kernel; results are unchanged in
+  the tests).
+- The KDA kernels' shared-memory stores also lower on JAX 0.12 (unchanged on JAX 0.11.2).
+
+### Tests
+
+- New Blackwell tests: tcgen05 products against a float32 reference (grids of 1 to 1000 CTAs, warp
+  specialization), determinism, NaN propagation, independence from earlier calls, and the benchmark's
+  own shapes against the chunked op (outputs and every gradient).
+- The Gated DeltaNet, DeltaNet, simple GLA and KDA GPU tests also run on Blackwell with `JLA_BLACKWELL=1`.
+
+### Known limits
+
+- On Blackwell, the opt-in fused Gated DeltaNet backward needs 128-row tiles and raises
+  `NotImplementedError`; Gated DeltaNet-2's opt-in fused solve at head dim 128 exceeds shared memory;
+  KDA's reference backward schedule matches the default only to the tolerance.
+- B200 trails the same kernels on an H200 by 4-20%; the Blackwell kernels are not tuned yet.
+
 ## 0.1.0 - 2026-10-21
 
 First public release.
